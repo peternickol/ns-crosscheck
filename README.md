@@ -102,9 +102,9 @@ Each side is a list of hosts or one zone file. A host is passed to `dig` as
 holds. The report shows the address `dig` reached and how long the SOA query
 took.
 
-Leave `--old` out and `dig +trace` supplies the current nameservers. Leave
-`--new` out as well and the command checks that those servers agree with each
-other.
+A domain by itself prints the nameservers the registry delegates to, with
+the address of each one. Pass `--old` or `--new` to compare records. Leave
+`--old` out of a comparison and `dig +trace` supplies the current nameservers.
 
 ```bash
 ns-crosscheck example.com --old ns1.old.net --old ns2.old.net --new ns1.new.net --new ns2.new.net

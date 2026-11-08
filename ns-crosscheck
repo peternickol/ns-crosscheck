@@ -41,7 +41,7 @@ import subprocess
 import sys
 
 APP_ID = 'ns-crosscheck'
-VERSION = '0.1.10'
+VERSION = '0.1.11'
 MIN_PYTHON = (3, 10)
 MAX_NAMES = 2000
 RESOLVERS = (('1.1.1.1', '1.1.1.1'), ('8.8.8.8', '8.8.8.8'), ('9.9.9.9', '9.9.9.9'))
@@ -128,6 +128,7 @@ class Delegation:
     ds: tuple = ()
     error: str | None = None
     summary: str = ''
+    addresses: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -882,17 +883,29 @@ def parse_trace(text, zone):
     zone = normalize_name(zone)
     found = None
     for chunk in text.split(';; Received'):
-        names, ds = [], []
+        names, ds, glue = [], [], {}
         for line in chunk.splitlines():
             record = parse_rr(line.split(';', 1)[0].strip())
-            if not record or record[0] != zone:
+            if not record:
                 continue
-            if record[2] == 'NS':
-                names.append(record[3].split()[0])
-            elif record[2] == 'DS':
-                ds.append(record[3])
+            owner, _ttl, rtype, data = record
+            if owner == zone and rtype == 'NS':
+                names.append(data.split()[0])
+            elif owner == zone and rtype == 'DS':
+                ds.append(data)
+            elif rtype in ('A', 'AAAA'):
+                glue.setdefault(owner, []).append(data.split()[0])
         if names and found is None:
-            found = (tuple(sorted(set(names))), tuple(sorted(set(ds))))
+            addresses = {normalize_name(name): [] for name in names}
+            for owner, values in glue.items():
+                key = normalize_name(owner)
+                if key in addresses:
+                    addresses[key].extend(values)
+            found = (
+                tuple(sorted(set(names))),
+                tuple(sorted(set(ds))),
+                {key: tuple(dict.fromkeys(values)) for key, values in addresses.items()},
+            )
     if found is None:
         low = text.lower()
         if 'refused' in low:
@@ -900,7 +913,7 @@ def parse_trace(text, zone):
         if 'timed out' in low or 'no servers could be reached' in low:
             return Delegation(error='The parent servers did not answer.')
         return Delegation(error='The parent response had no referral.')
-    return Delegation(names=found[0], ds=found[1])
+    return Delegation(names=found[0], ds=found[1], addresses=found[2])
 
 
 def _unquote(text):
@@ -2022,6 +2035,69 @@ def _ttl(values, ttl):
     return tuple(f'{value}  TTL {ttl}' for value in values)
 
 
+def nameserver_list(domain, timeout, port):
+    shown = display_name(normalize_name(domain))
+    delegation = trace(shown, timeout)
+    if not delegation.names:
+        detail = delegation.error or 'no nameservers were returned'
+        raise Fail(f'The current nameservers could not be found. {detail}')
+    rows = []
+    for name in delegation.names:
+        key = normalize_name(name)
+        have = list(delegation.addresses.get(key, ()))
+        if not any(':' not in item for item in have):
+            have.extend(_lookup_addresses(key, 'A', timeout, port))
+        if not any(':' in item for item in have):
+            have.extend(_lookup_addresses(key, 'AAAA', timeout, port))
+        seen = []
+        for item in have:
+            if item not in seen:
+                seen.append(item)
+        v4 = [item for item in seen if ':' not in item]
+        v6 = [item for item in seen if ':' in item]
+        rows.append((display_name(name), tuple(v4 + v6)))
+    rows.sort(key=lambda row: row[0])
+    return shown, rows
+
+
+def _lookup_addresses(name, rtype, timeout, port):
+    for address, _label in RESOLVERS:
+        outcome = query(address, display_name(name), rtype, timeout, port, rd=True)
+        if isinstance(outcome[0], str):
+            continue
+        status, _flags = outcome[0]
+        answers = outcome[1]
+        if status == 'NXDOMAIN':
+            return []
+        if status != 'NOERROR':
+            continue
+        return [item[3].split()[0] for item in answers if item[2] == rtype]
+    return []
+
+
+def render_nameservers(domain, rows, color):
+    lines = [paint(domain, '1;36', color), '', paint('Nameservers', '1;36', color)]
+    for name, addresses in rows:
+        extra = f'  {"  ".join(addresses)}' if addresses else ''
+        lines.append(f'  {name}{extra}')
+    lines.append('')
+    return '\n'.join(lines)
+
+
+def nameservers_json(domain, rows):
+    return {
+        'domain': domain,
+        'nameservers': [{'name': name, 'addresses': list(addresses)} for name, addresses in rows],
+    }
+
+
+def _listing(args):
+    return not any((
+        args.old, args.new, args.old_zone, args.new_zone, args.names, args.types,
+        args.no_axfr, args.no_delegation, args.no_resolvers, args.strict_ttl, args.review, args.demo,
+    ))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog='ns-crosscheck',
@@ -2060,6 +2136,19 @@ def main(argv=None):
         if not updater.is_file():
             parser.error('This copy has no installed updater. Run the installer, or update your source checkout with Git.')
         raise SystemExit(subprocess.call([sys.executable, str(updater)]))
+    if args.domain and _listing(args):
+        if args.timeout <= 0:
+            parser.error('--timeout must be greater than zero.')
+        try:
+            shown, rows = nameserver_list(args.domain, args.timeout, args.port)
+        except Fail as error:
+            print(f'ns-crosscheck: {error}', file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(nameservers_json(shown, rows), indent=2))
+        else:
+            sys.stdout.write(render_nameservers(shown, rows, _color(args)))
+        return 0
     try:
         report = _report(parser, args)
     except Fail as error:
