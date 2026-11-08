@@ -131,7 +131,10 @@ transfer. `--port` and `--timeout` are passed through to `dig`. The default
 port is 53 and the default wait is 3 seconds. Options in `~/.digrc` are
 ignored. A query that is refused or does not answer is tried again over TCP,
 and then with recursion. A recursive answer is used only when the server marks
-it authoritative.
+it authoritative. A non-recursive reply with the recursion-available bit set came from a
+resolver on the path. The command tries IPv6, and on Linux it retries through
+the route selected by a packet mark in `ip rule` when this process is allowed
+to set that mark.
 
 `--no-delegation` skips `dig +trace`. `--no-resolvers` skips the three public
 resolvers. Those lookups describe the move. The exit status follows the
@@ -148,7 +151,7 @@ A zone file is compiled with `named-compilezone` and then compared as text.
 The command exits 1 when `dig` shows any of these:
 
 - Record data differs, or a record exists on only one side.
-- A server does not answer, refuses the zone, or answers without the authoritative bit.
+- A server does not answer, refuses the zone, answers without the authoritative bit, or a resolver on the path answers in its place.
 - Servers on the same side disagree. The copy with the highest SOA serial is the reference. Serial order follows RFC 1982.
 - The new serial is behind the old serial. A new serial that is ahead is a note.
 - The SOA primary name or mailbox differs. Refresh, retry, expire, and minimum differ as a note.

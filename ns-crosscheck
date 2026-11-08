@@ -25,8 +25,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import random
+import socket
+import struct
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -35,7 +40,7 @@ import subprocess
 import sys
 
 APP_ID = 'ns-crosscheck'
-VERSION = '0.1.2'
+VERSION = '0.1.3'
 MIN_PYTHON = (3, 10)
 MAX_NAMES = 2000
 RESOLVERS = (('1.1.1.1', '1.1.1.1'), ('8.8.8.8', '8.8.8.8'), ('9.9.9.9', '9.9.9.9'))
@@ -217,6 +222,31 @@ _PLANS = (
     (False, True, ('+noedns',)),
     (True, True, ('+noedns',)),
 )
+# None: not tried. False: unavailable. An int is the packet mark that reaches
+# the nameserver when a resolver on this path answers in its place.
+_direct_mark = None
+_mark_denied = False
+_ipv6 = False
+_ipv6_tried = False
+_ROOTS = (
+    '198.41.0.4', '170.247.170.2', '192.33.4.12', '199.7.91.13',
+    '192.203.230.10', '192.5.5.241', '192.112.36.4', '198.97.190.53',
+    '192.36.148.17', '192.58.128.30', '193.0.14.129', '199.7.83.42',
+    '202.12.27.33',
+)
+_QTYPE = {
+    'A': 1, 'NS': 2, 'CNAME': 5, 'SOA': 6, 'PTR': 12, 'MX': 15, 'TXT': 16,
+    'AAAA': 28, 'SRV': 33, 'DS': 43, 'DNSKEY': 48, 'CAA': 257, 'AXFR': 252,
+}
+_TYPE_NAME = {value: key for key, value in _QTYPE.items()}
+_RCODE = {
+    0: 'NOERROR', 1: 'FORMERR', 2: 'SERVFAIL', 3: 'NXDOMAIN', 4: 'NOTIMP',
+    5: 'REFUSED', 8: 'NOTZONE', 9: 'NOTAUTH',
+}
+_FLAG_BITS = (
+    (0x8000, 'qr'), (0x0400, 'aa'), (0x0200, 'tc'), (0x0100, 'rd'),
+    (0x0080, 'ra'), (0x0020, 'ad'), (0x0010, 'cd'),
+)
 
 
 def run_dig(args, timeout, limit):
@@ -242,47 +272,493 @@ def run_dig(args, timeout, limit):
 
 
 def query(host, name, rtype, timeout, port, rd, tcp=False, extra=()):
+    global _ipv6, _ipv6_tried
+    if isinstance(_direct_mark, int):
+        return _direct_query(host, name, rtype, timeout, port, rd, tcp or rtype == 'AXFR', _direct_mark)
+    outcome = _dig_query(host, name, rtype, timeout, port, rd, tcp, extra, ipv6=_ipv6)
+    if not _path_answered(outcome, rd):
+        return outcome
+    if not _ipv6 and not _ipv6_tried:
+        _ipv6_tried = True
+        alt = _dig_query(host, name, rtype, timeout, port, rd, tcp, extra, ipv6=True)
+        if _authoritative_soa(alt, require_aa=True):
+            _ipv6 = True
+            return alt
+    mark = _activate_mark(timeout)
+    if mark is None:
+        return outcome
+    return _direct_query(host, name, rtype, timeout, port, rd, tcp, mark)
+
+
+def transfer(host, name, timeout, port, tcp=False):
+    if isinstance(_direct_mark, int):
+        return _direct_transfer(host, name, timeout, port, _direct_mark)
+    return _dig_query(host, name, 'AXFR', timeout, port, True, tcp, (), ipv6=_ipv6, limit=60)
+
+
+def trace(name, timeout):
+    global _ipv6, _ipv6_tried
+    if isinstance(_direct_mark, int):
+        return _direct_trace(name, timeout)
+    parsed, text = _trace(name, timeout, tcp=False, ipv6=_ipv6)
+    redirected = _trace_redirected(text)
+    if not parsed.names and parsed.error and not redirected:
+        alt, alt_text = _trace(name, timeout, tcp=True, ipv6=_ipv6)
+        if alt.names:
+            return alt
+        redirected = _trace_redirected(alt_text)
+    if not parsed.names and not _ipv6 and not _ipv6_tried:
+        _ipv6_tried = True
+        alt, _alt_text = _trace(name, timeout, tcp=False, ipv6=True)
+        if alt.names:
+            _ipv6 = True
+            return alt
+    if not parsed.names and redirected:
+        mark = _activate_mark(timeout)
+        if mark is not None:
+            return _direct_trace(name, timeout)
+        return Delegation(error='A resolver on this path answered the parent lookup.')
+    return parsed
+
+
+def _dig_query(host, name, rtype, timeout, port, rd, tcp, extra, ipv6, limit=15):
     seconds = dig_timeout(timeout)
     args = [f'@{host}', '-p', str(port), name, rtype, f'+timeout={seconds}', '+tries=1', *_DIG_OPTS, *extra, '+yaml']
     if tcp:
         args.append('+tcp')
-    if not rd:
+    if not rd and rtype != 'AXFR':
         args.append('+norecurse')
-    text, failure, _code = run_dig(args, timeout, seconds + 15)
+    if ipv6:
+        args.append('-6')
+    text, failure, _code = run_dig(args, timeout, seconds + limit)
     if failure:
         return failure, [], [], '', None
     return parse_message(text)
 
 
-def transfer(host, name, timeout, port, tcp=False):
-    seconds = dig_timeout(timeout)
-    args = [f'@{host}', '-p', str(port), name, 'AXFR', f'+timeout={seconds}', '+tries=1', *_DIG_OPTS, '+yaml']
-    if tcp:
-        args.append('+tcp')
-    text, failure, _code = run_dig(args, timeout, seconds + 60)
-    if failure:
-        return failure, [], [], '', None
-    return parse_message(text)
-
-
-def trace(name, timeout):
-    parsed = _trace(name, timeout, tcp=False)
-    if parsed.error:
-        alt = _trace(name, timeout, tcp=True)
-        if not alt.error:
-            return alt
-    return parsed
-
-
-def _trace(name, timeout, tcp):
+def _trace(name, timeout, tcp, ipv6):
     seconds = dig_timeout(timeout)
     args = [name, 'NS', '+trace', '+nodnssec', f'+timeout={seconds}', '+tries=1', *_DIG_OPTS]
     if tcp:
         args.append('+tcp')
+    if ipv6:
+        args.append('-6')
     text, failure, _code = run_dig(args, timeout, seconds + 60)
     if failure:
-        return Delegation(error='The parent servers did not answer.')
-    return parse_trace(text, name)
+        return Delegation(error='The parent servers did not answer.'), ''
+    return parse_trace(text, name), text
+
+
+def _path_answered(outcome, rd):
+    """A non-recursive reply with RA set was answered by a resolver on the path."""
+    if rd or isinstance(outcome[0], str):
+        return False
+    (_status, flags), _answers, _authority, _address, _elapsed = outcome
+    bits = flags.split()
+    return 'ra' in bits and 'aa' not in bits
+
+
+def _trace_redirected(text):
+    for line in text.splitlines():
+        if 'Received' not in line or 'bytes' not in line:
+            continue
+        parts = line.split()
+        try:
+            size = int(parts[parts.index('Received') + 1])
+        except (ValueError, IndexError):
+            continue
+        if size <= 48:
+            return True
+    return False
+
+
+def _routing_marks():
+    if not sys.platform.startswith('linux') or shutil.which('ip') is None:
+        return []
+    try:
+        result = subprocess.run(['ip', '-4', 'rule', 'show'], capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    marks = []
+    for line in result.stdout.splitlines():
+        if 'fwmark' not in line:
+            continue
+        before, after = line.split('fwmark', 1)
+        if 'not' not in before:
+            continue
+        token = after.split()
+        if not token:
+            continue
+        try:
+            marks.append(int(token[0], 0))
+        except ValueError:
+            continue
+    return marks
+
+
+def _can_mark(mark):
+    if not hasattr(socket, 'SO_MARK'):
+        return False
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, mark)
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _activate_mark(timeout):
+    global _direct_mark, _mark_denied
+    if isinstance(_direct_mark, int):
+        return _direct_mark
+    if _direct_mark is False or os.environ.get('NSC_FIXTURE'):
+        _direct_mark = False
+        return None
+    marks = _routing_marks()
+    if not marks:
+        _direct_mark = False
+        return None
+    if not _can_mark(marks[0]):
+        _mark_denied = True
+        _direct_mark = False
+        return None
+    for mark in marks:
+        for root in _ROOTS[:3]:
+            outcome = _direct_query(root, 'example.com', 'NS', min(timeout, 3), 53, False, False, mark)
+            if _direct_reached(outcome):
+                _direct_mark = mark
+                return mark
+    _direct_mark = False
+    return None
+
+
+def _direct_reached(outcome):
+    if isinstance(outcome[0], str) or _path_answered(outcome, False):
+        return False
+    (status, _flags), answers, authority, _address, _elapsed = outcome
+    return status == 'NOERROR' and bool(answers or authority)
+
+
+def _resolve(host):
+    text = host.strip().strip('[]')
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, text)
+            return text, family
+        except OSError:
+            continue
+    infos = socket.getaddrinfo(text, 53, socket.AF_INET, socket.SOCK_DGRAM)
+    return infos[0][4][0], socket.AF_INET
+
+
+def _marked_socket(family, kind, mark, timeout):
+    sock = socket.socket(family, kind)
+    sock.settimeout(timeout)
+    if mark is not None and hasattr(socket, 'SO_MARK'):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, mark)
+    return sock
+
+
+def _direct_query(host, name, rtype, timeout, port, rd, tcp, mark, edns=True):
+    started = time.monotonic()
+    try:
+        address, family = _resolve(host)
+    except OSError:
+        return 'unresolved', [], [], '', None
+    try:
+        if tcp:
+            payload = _exchange_tcp(address, family, port, name, rtype, rd, mark, timeout, edns)
+        else:
+            payload = _exchange_udp(address, family, port, name, rtype, rd, mark, timeout, edns)
+        status, flags, answers, authority, truncated = _parse_dns(payload)
+    except socket.timeout:
+        return 'timeout', [], [], address, None
+    except OSError:
+        return 'unreachable', [], [], address, None
+    except (ValueError, struct.error, UnicodeError):
+        return 'error', [], [], address, None
+    if truncated and not tcp:
+        return _direct_query(host, name, rtype, timeout, port, rd, True, mark, edns)
+    if status == 'FORMERR' and edns:
+        return _direct_query(host, name, rtype, timeout, port, rd, tcp, mark, edns=False)
+    elapsed = max(0, int((time.monotonic() - started) * 1000))
+    return (status, flags), answers, authority, address, elapsed
+
+
+def _direct_transfer(host, name, timeout, port, mark):
+    started = time.monotonic()
+    try:
+        address, family = _resolve(host)
+    except OSError:
+        return 'unresolved', [], [], '', None
+    sock = _marked_socket(family, socket.SOCK_STREAM, mark, dig_timeout(timeout))
+    try:
+        tid, query = _build_query(name, 'AXFR', False, True)
+        sock.connect((address, port))
+        sock.sendall(struct.pack('!H', len(query)) + query)
+        answers = []
+        status, flags = 'NOERROR', ''
+        seen = 0
+        origin = normalize_name(name)
+        while seen < 2 and len(answers) < 100000:
+            payload = _read_frame(sock)
+            got, got_flags, records, _authority, _truncated = _parse_dns(payload)
+            if payload[0:2] != tid.to_bytes(2, 'big'):
+                return 'error', [], [], address, None
+            status, flags = got, got_flags
+            if status != 'NOERROR':
+                break
+            answers.extend(records)
+            seen += sum(1 for item in records if item[2] == 'SOA' and item[0] == origin)
+    except socket.timeout:
+        return 'timeout', [], [], address, None
+    except OSError:
+        return 'unreachable', [], [], address, None
+    except (ValueError, struct.error, UnicodeError):
+        return 'error', [], [], address, None
+    finally:
+        sock.close()
+    elapsed = max(0, int((time.monotonic() - started) * 1000))
+    return (status, flags), answers, [], address, elapsed
+
+
+def _direct_trace(zone, timeout):
+    zone = normalize_name(zone)
+    pending = list(_ROOTS)
+    seen = set()
+    for _step in range(10):
+        outcome = None
+        for host in pending:
+            if host in seen:
+                continue
+            seen.add(host)
+            outcome = _direct_query(host, display_name(zone), 'NS', timeout, 53, False, False, _direct_mark)
+            if not isinstance(outcome[0], str):
+                break
+            outcome = None
+        if outcome is None:
+            return Delegation(error='The parent servers did not answer.')
+        (status, flags), answers, authority, _address, _elapsed = outcome
+        if status != 'NOERROR':
+            return Delegation(error='The parent servers did not answer.')
+        records = [item for item in authority + answers if item[2] == 'NS' and (item[0] == '.' or zone == item[0] or zone.endswith('.' + item[0]))]
+        if not records:
+            return Delegation(error='The parent response had no referral.')
+        owner = max({item[0] for item in records}, key=len)
+        chosen = [item for item in records if item[0] == owner]
+        names = tuple(sorted({item[3].split()[0] for item in chosen}))
+        ds = tuple(sorted({item[3] for item in authority + answers if item[0] == zone and item[2] == 'DS'}))
+        if owner == zone:
+            return Delegation(names=names, ds=ds)
+        nxt = []
+        for item in chosen:
+            try:
+                ip, _family = _resolve(item[3].split()[0].rstrip('.'))
+            except OSError:
+                continue
+            nxt.append(ip)
+        if not nxt:
+            return Delegation(error='The parent servers did not answer.')
+        pending = nxt
+    return Delegation(error='The parent response had no referral.')
+
+
+def _exchange_udp(address, family, port, name, rtype, rd, mark, timeout, edns):
+    tid, query = _build_query(name, rtype, rd, edns)
+    sock = _marked_socket(family, socket.SOCK_DGRAM, mark, dig_timeout(timeout))
+    try:
+        sock.sendto(query, (address, port))
+        payload = sock.recv(4096)
+    finally:
+        sock.close()
+    if len(payload) < 2 or payload[0:2] != tid.to_bytes(2, 'big'):
+        raise ValueError('mismatched reply')
+    return payload
+
+
+def _exchange_tcp(address, family, port, name, rtype, rd, mark, timeout, edns):
+    tid, query = _build_query(name, rtype, rd, edns)
+    sock = _marked_socket(family, socket.SOCK_STREAM, mark, dig_timeout(timeout))
+    try:
+        sock.connect((address, port))
+        sock.sendall(struct.pack('!H', len(query)) + query)
+        payload = _read_frame(sock)
+    finally:
+        sock.close()
+    if len(payload) < 2 or payload[0:2] != tid.to_bytes(2, 'big'):
+        raise ValueError('mismatched reply')
+    return payload
+
+
+def _read_frame(sock):
+    header = _read_exact(sock, 2)
+    size = struct.unpack('!H', header)[0]
+    if size < 12:
+        raise ValueError('short frame')
+    return _read_exact(sock, size)
+
+
+def _read_exact(sock, size):
+    chunks = []
+    got = 0
+    while got < size:
+        piece = sock.recv(size - got)
+        if not piece:
+            raise ValueError('closed')
+        chunks.append(piece)
+        got += len(piece)
+    return b''.join(chunks)
+
+
+def _build_query(name, rtype, rd, edns):
+    tid = random.randrange(65536)
+    flags = 0x0100 if rd else 0
+    extra = 1 if edns else 0
+    header = struct.pack('!HHHHHH', tid, flags, 1, 0, 0, extra)
+    question = _encode_name(name) + struct.pack('!HH', _QTYPE[rtype], 1)
+    if edns:
+        question += b'\x00' + struct.pack('!HHIH', 41, 1232, 0, 0)
+    return tid, header + question
+
+
+def _encode_name(name):
+    text = str(name).strip().rstrip('.')
+    if not text:
+        return b'\x00'
+    out = bytearray()
+    for label in text.split('.'):
+        raw = label.encode('idna')
+        if not raw or len(raw) > 63:
+            raise ValueError(label)
+        out.append(len(raw))
+        out.extend(raw)
+    out.append(0)
+    return bytes(out)
+
+
+def _parse_dns(data):
+    if len(data) < 12:
+        raise ValueError('short header')
+    _tid, flags, qd, an, ns, _ar = struct.unpack_from('!HHHHHH', data)
+    if not flags & 0x8000:
+        raise ValueError('not a response')
+    status = _RCODE.get(flags & 0xF, 'error')
+    bits = [name for mask, name in _FLAG_BITS if flags & mask]
+    offset = 12
+    for _ in range(qd):
+        offset = _skip_name(data, offset) + 4
+    answers, offset = _parse_rrs(data, offset, an)
+    authority, _offset = _parse_rrs(data, offset, ns)
+    return status, ' '.join(bits), answers, authority, bool(flags & 0x0200)
+
+
+def _parse_rrs(data, offset, count):
+    records = []
+    for _ in range(count):
+        owner, offset = _parse_name(data, offset)
+        if offset + 10 > len(data):
+            raise ValueError('short record')
+        rtype, _rclass, ttl, rdlen = struct.unpack_from('!HHIH', data, offset)
+        offset += 10
+        if offset + rdlen > len(data):
+            raise ValueError('short rdata')
+        if rtype != 41:
+            records.append((normalize_name(owner), ttl, _TYPE_NAME.get(rtype, str(rtype)), _present(rtype, data, offset, rdlen)))
+        offset += rdlen
+    return records, offset
+
+
+def _present(rtype, data, offset, rdlen):
+    end = offset + rdlen
+    if rtype == 1 and rdlen == 4:
+        return socket.inet_ntop(socket.AF_INET, data[offset:end])
+    if rtype == 28 and rdlen == 16:
+        return socket.inet_ntop(socket.AF_INET6, data[offset:end])
+    if rtype in (2, 5, 12):
+        name, _offset = _parse_name(data, offset)
+        return name
+    if rtype == 6:
+        mname, cursor = _parse_name(data, offset)
+        rname, cursor = _parse_name(data, cursor)
+        serial, refresh, retry, expire, minimum = struct.unpack_from('!IIIII', data, cursor)
+        return f'{mname} {rname} {serial} {refresh} {retry} {expire} {minimum}'
+    if rtype == 15 and rdlen >= 3:
+        pref = struct.unpack_from('!H', data, offset)[0]
+        host, _cursor = _parse_name(data, offset + 2)
+        return f'{pref} {host}'
+    if rtype == 16:
+        texts = []
+        cursor = offset
+        while cursor < end:
+            size = data[cursor]
+            cursor += 1
+            texts.append(json.dumps(data[cursor:cursor + size].decode('utf-8', 'replace')))
+            cursor += size
+        return ' '.join(texts)
+    if rtype == 33 and rdlen >= 7:
+        prio, weight, number = struct.unpack_from('!HHH', data, offset)
+        target, _cursor = _parse_name(data, offset + 6)
+        return f'{prio} {weight} {number} {target}'
+    if rtype == 43 and rdlen >= 4:
+        keytag, alg, digest = struct.unpack_from('!HBB', data, offset)
+        return f'{keytag} {alg} {digest} {data[offset + 4:end].hex()}'
+    if rtype == 48 and rdlen >= 4:
+        flags, proto, alg = struct.unpack_from('!HBB', data, offset)
+        key = base64.b64encode(data[offset + 4:end]).decode('ascii')
+        return f'{flags} {proto} {alg} {key}'
+    if rtype == 257 and rdlen >= 2:
+        tag_len = data[offset + 1]
+        tag = data[offset + 2:offset + 2 + tag_len].decode('ascii', 'replace')
+        value = data[offset + 2 + tag_len:end].decode('utf-8', 'replace')
+        return f'{data[offset]} {tag} {json.dumps(value)}'
+    return data[offset:end].hex()
+
+
+def _parse_name(data, offset):
+    labels = []
+    hopped = False
+    end = offset
+    seen = set()
+    while True:
+        if offset >= len(data) or offset in seen:
+            raise ValueError('bad name')
+        seen.add(offset)
+        length = data[offset]
+        if length == 0:
+            if not hopped:
+                end = offset + 1
+            break
+        if length & 0xC0 == 0xC0:
+            if offset + 1 >= len(data):
+                raise ValueError('bad pointer')
+            if not hopped:
+                end = offset + 2
+            offset = ((length & 0x3F) << 8) | data[offset + 1]
+            hopped = True
+            continue
+        if length & 0xC0:
+            raise ValueError('bad label')
+        offset += 1
+        labels.append(_label_text(data[offset:offset + length]))
+        offset += length
+        if not hopped:
+            end = offset
+    return '.'.join(labels) + '.', end
+
+
+def _skip_name(data, offset):
+    _name, end = _parse_name(data, offset)
+    return end
+
+
+def _label_text(raw):
+    try:
+        text = raw.decode('ascii')
+    except UnicodeError:
+        return ''.join(chr(byte) if 33 <= byte < 127 else f'\\{byte:03d}' for byte in raw)
+    return ''.join('\\' + char if char in '.\\"' else char for char in text)
 
 
 def parse_message(text):
@@ -481,6 +957,8 @@ def probe(host, domain, axfr, timeout, port):
         return Server(host, address, failure, _failure_detail(failure), elapsed_ms=elapsed)
     (status, flags), answers, _authority, address, elapsed = outcome
     if status != 'NOERROR' or not any(item[2] == 'SOA' for item in answers):
+        if _path_answered(outcome, False):
+            return Server(host, address, 'redirected', 'answered by a resolver on this path', elapsed_ms=elapsed)
         code = 'nodata' if status == 'NOERROR' else _status_code(status)
         return Server(host, address, code, _failure_detail(code), elapsed_ms=elapsed)
     server = Server(
@@ -659,16 +1137,19 @@ def _mentioned(rtype, data, origin):
 def check(config):
     domain = normalize_name(config.domain)
     shown = display_name(domain)
-    delegation = trace(shown, config.timeout) if config.delegation else None
     old_hosts = tuple(config.old_hosts)
+    delegation = None
     if not old_hosts and not config.old_zone:
-        if delegation is None:
+        if not config.delegation:
             raise Fail('Pass --old or --old-zone, or allow the delegation lookup.')
+        delegation = trace(shown, config.timeout)
         if not delegation.names:
             raise Fail(f'The current nameservers could not be found. {delegation.error or "no nameservers were returned"}')
         old_hosts = tuple(display_name(name) for name in delegation.names)
     old = load_side(old_hosts, config.old_zone, shown, 'Old zone', config.axfr, config.timeout, config.port)
     new = load_side(config.new_hosts, config.new_zone, shown, 'New zone', config.axfr, config.timeout, config.port)
+    if delegation is None and config.delegation:
+        delegation = trace(shown, config.timeout)
     mode = 'compare' if config.new_hosts or config.new_zone else 'consistency'
     capped = fill(old + new, shown, config.names, config.types, config.timeout, config.port)
     return _assemble(config, domain, mode, old, new, delegation, capped)
@@ -947,6 +1428,8 @@ def _server_finding(server, domain):
         'timeout': f'{host} did not answer{where}.',
         'unreachable': f'{host} is unreachable{where}.',
         'refused': f'{host} refused the zone{where}.',
+        'redirected': f'{host} was not reached{where}. A resolver on this path answered.'
+        + (' This process cannot set the routing mark that would avoid it. Run the command with sudo.' if _mark_denied else ''),
         'servfail': f'{host} does not serve {shown} (SERVFAIL).',
         'nxdomain': f'{host} has no zone for {shown}.',
         'notauth': f'{host} is not authoritative for {shown}.',

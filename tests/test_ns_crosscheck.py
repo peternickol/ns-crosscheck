@@ -1,10 +1,12 @@
 import os
 from pathlib import Path
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -151,7 +153,7 @@ class ToolTest(unittest.TestCase):
         self.assertIn('\033[31m', colored.stdout)
         self.assertIn('\033[32m', colored.stdout)
         version = self.command('--version', path='/usr/bin')
-        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.2')
+        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.3')
 
     def test_dig_transfer_reports_the_move(self):
         self.place('ns1.old.test', 'example.com', 'SOA', message(
@@ -309,6 +311,40 @@ class ToolTest(unittest.TestCase):
         self.assertIn('No records were read from the nameservers.', result.stdout)
         self.assertNotIn('SOA 1', result.stdout)
 
+    def test_recursion_available_on_a_direct_query_is_not_the_server(self):
+        for host, address in (('ns1.old.test', '192.0.2.1'), ('ns1.new.test', '198.51.100.1')):
+            self.place(host, 'example.com', 'SOA', message(address, 'REFUSED', 'qr ra', []))
+        result = self.command(
+            'example.com', '--old', 'ns1.old.test', '--new', 'ns1.new.test',
+            '--no-delegation', '--no-resolvers', '--plain',
+        )
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn('ns1.old.test was not reached at 192.0.2.1. A resolver on this path answered.', result.stdout)
+        self.assertIn('answered by a resolver on this path', result.stdout)
+        self.assertNotIn('refused the zone', result.stdout)
+        self.assertIn('No records were read from the nameservers.', result.stdout)
+
+    def test_dns_parser_reads_an_authoritative_soa(self):
+        module = types.ModuleType('nscrosscheck_under_test')
+        sys.modules[module.__name__] = module
+        try:
+            exec(compile(PROGRAM.read_text(encoding='utf-8'), str(PROGRAM), 'exec'), module.__dict__)
+        finally:
+            sys.modules.pop(module.__name__, None)
+        name = module._encode_name('example.com')
+        rdata = module._encode_name('ns1.example.com') + module._encode_name('host.example.com')
+        rdata += struct.pack('!IIIII', 7, 1, 2, 3, 4)
+        question = name + struct.pack('!HH', 6, 1)
+        answer = name + struct.pack('!HHIH', 6, 1, 300, len(rdata)) + rdata
+        packet = struct.pack('!HHHHHH', 1, 0x8400, 1, 1, 0, 0) + question + answer
+        status, flags, answers, _authority, truncated = module._parse_dns(packet)
+        self.assertEqual(status, 'NOERROR')
+        self.assertIn('aa', flags.split())
+        self.assertFalse(truncated)
+        self.assertEqual(answers[0][2], 'SOA')
+        self.assertEqual(answers[0][1], 300)
+        self.assertIn('ns1.example.com. host.example.com. 7 1 2 3 4', answers[0][3])
+
     def test_trace_and_review_stay_with_dig(self):
         (self.fixture / 'trace_example.com').write_text(
             '. 100 IN NS a.root-servers.net.\n'
@@ -355,7 +391,7 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Installed NS Cross-check', result.stdout)
             version = subprocess.run([str(bindir / 'ns-crosscheck'), '--version'], check=False, capture_output=True, text=True)
-            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.2')
+            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.3')
             again = subprocess.run(
                 [sys.executable, str(ROOT / 'install.py'), '--from-dir', str(ROOT), '--bin-dir', str(bindir)],
                 check=False, capture_output=True, text=True,
