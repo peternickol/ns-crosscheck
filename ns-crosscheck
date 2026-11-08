@@ -29,6 +29,7 @@ import base64
 import json
 import os
 import random
+import shlex
 import socket
 import struct
 import time
@@ -40,7 +41,7 @@ import subprocess
 import sys
 
 APP_ID = 'ns-crosscheck'
-VERSION = '0.1.4'
+VERSION = '0.1.5'
 MIN_PYTHON = (3, 10)
 MAX_NAMES = 2000
 RESOLVERS = (('1.1.1.1', '1.1.1.1'), ('8.8.8.8', '8.8.8.8'), ('9.9.9.9', '9.9.9.9'))
@@ -414,6 +415,43 @@ def _can_mark(mark):
         sock.close()
 
 
+def _program_path():
+    candidate = sys.argv[0]
+    if os.path.sep in candidate and os.path.isfile(candidate):
+        return os.path.realpath(candidate)
+    found = shutil.which(candidate)
+    if found:
+        return os.path.realpath(found)
+    return os.path.realpath(candidate) if candidate else ''
+
+
+def _sudo_command():
+    program = _program_path()
+    return ' '.join(shlex.quote(part) for part in ('sudo', program, *sys.argv[1:]))
+
+
+def _maybe_elevate():
+    """Re-run this program under sudo by absolute path.
+
+    sudo's secure_path does not include ~/.local/bin, so `sudo ns-crosscheck`
+    cannot see an install there.
+    """
+    if os.environ.get('NSC_ELEVATED') or os.environ.get('NSC_FIXTURE'):
+        return False
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return False
+    sudo = shutil.which('sudo')
+    program = _program_path()
+    if not sudo or not program or not os.path.isfile(program):
+        return False
+    print('Reaching the nameservers needs a routing mark this user cannot set.', file=sys.stderr)
+    try:
+        os.execv(sudo, [sudo, 'NSC_ELEVATED=1', program, *sys.argv[1:]])
+    except OSError:
+        return False
+    return False
+
+
 def _activate_mark(timeout):
     global _direct_mark, _direct_blocked, _mark_denied
     if _direct_mark is not None:
@@ -426,6 +464,7 @@ def _activate_mark(timeout):
         _direct_blocked = True
         return None
     if not _can_mark(marks[0]):
+        _maybe_elevate()
         _mark_denied = True
         _direct_blocked = True
         return None
@@ -1169,7 +1208,7 @@ def _assemble(config, domain, mode, old, new, delegation, capped):
         elif server.status == 'answered' and not server.aa:
             findings.append(Finding('flaw', f'{server.host} answered without the authoritative bit.'))
     if _mark_denied:
-        findings.append(Finding('flaw', 'This process cannot set the routing mark that would reach those nameservers. Run the command with sudo.'))
+        findings.append(Finding('flaw', f'This process cannot set the routing mark that would reach those nameservers. Run: {_sudo_command()}'))
     old_ref = _reference(old)
     new_ref = _reference(new)
     findings.extend(_within(old, old_ref))

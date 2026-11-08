@@ -153,7 +153,7 @@ class ToolTest(unittest.TestCase):
         self.assertIn('\033[31m', colored.stdout)
         self.assertIn('\033[32m', colored.stdout)
         version = self.command('--version', path='/usr/bin')
-        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.4')
+        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.5')
 
     def test_dig_transfer_reports_the_move(self):
         self.place('ns1.old.test', 'example.com', 'SOA', message(
@@ -363,6 +363,22 @@ class ToolTest(unittest.TestCase):
         self.assertEqual(answers[0][2], 'SOA')
         self.assertEqual(answers[0][1], 300)
         self.assertIn('ns1.example.com. host.example.com. 7 1 2 3 4', answers[0][3])
+        saved_argv = module.sys.argv
+        saved_elevated = module.os.environ.get('NSC_ELEVATED')
+        try:
+            module.sys.argv = [str(PROGRAM), 'example.com', '--old', 'ns 1']
+            command = module._sudo_command()
+            self.assertTrue(command.startswith('sudo '))
+            self.assertIn(str(PROGRAM), command)
+            self.assertIn("'ns 1'", command)
+            module.os.environ['NSC_ELEVATED'] = '1'
+            self.assertFalse(module._maybe_elevate())
+        finally:
+            module.sys.argv = saved_argv
+            if saved_elevated is None:
+                module.os.environ.pop('NSC_ELEVATED', None)
+            else:
+                module.os.environ['NSC_ELEVATED'] = saved_elevated
 
     def test_trace_and_review_stay_with_dig(self):
         (self.fixture / 'trace_example.com').write_text(
@@ -410,7 +426,7 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Installed NS Cross-check', result.stdout)
             version = subprocess.run([str(bindir / 'ns-crosscheck'), '--version'], check=False, capture_output=True, text=True)
-            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.4')
+            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.5')
             again = subprocess.run(
                 [sys.executable, str(ROOT / 'install.py'), '--from-dir', str(ROOT), '--bin-dir', str(bindir)],
                 check=False, capture_output=True, text=True,

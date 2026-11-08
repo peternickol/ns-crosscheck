@@ -35,7 +35,7 @@ import urllib.request
 import zipfile
 
 APP_ID = 'ns-crosscheck-update'
-VERSION = '0.1.4'
+VERSION = '0.1.5'
 MIN_PYTHON = (3, 10)
 REPOSITORY = 'peternickol/ns-crosscheck'
 SOURCE_URL = f'https://codeload.github.com/{REPOSITORY}/zip/refs/heads/master'
