@@ -22,7 +22,15 @@ DIG = textwrap.dedent("""\
     if '+trace' in args:
         path = root / (('trace_tcp_' if '+tcp' in args else 'trace_') + args[0])
     else:
-        path = root / f'{args[0][1:]}__{args[3]}__{args[4]}{"__tcp" if "+tcp" in args else ""}'
+        host = args[0][1:]
+        base = f'{host}__{args[3]}__{args[4]}'
+        if '+tcp' in args:
+            path = root / f'{base}__tcp'
+        elif '+norecurse' not in args:
+            recursive = root / f'{base}__rd'
+            path = recursive if recursive.is_file() else root / base
+        else:
+            path = root / base
     if not path.is_file():
         host = args[0][1:] if args and args[0].startswith('@') else ''
         if host and any(item.name.startswith(host + '__') for item in root.iterdir()):
@@ -143,7 +151,7 @@ class ToolTest(unittest.TestCase):
         self.assertIn('\033[31m', colored.stdout)
         self.assertIn('\033[32m', colored.stdout)
         version = self.command('--version', path='/usr/bin')
-        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.1')
+        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.2')
 
     def test_dig_transfer_reports_the_move(self):
         self.place('ns1.old.test', 'example.com', 'SOA', message(
@@ -267,6 +275,40 @@ class ToolTest(unittest.TestCase):
         self.assertIn('@ns1.old.test -p 53 example.com SOA', calls)
         self.assertIn('+tcp', calls)
 
+    def test_recursive_authoritative_answer_is_used_when_norecurse_is_refused(self):
+        soa = 'example.com. 3600 IN SOA ns1.old.test. host.example.com. 1 1 1 1 1'
+        for host, address, address_a in (
+            ('ns1.old.test', '192.0.2.1', '192.0.2.10'),
+            ('ns1.new.test', '198.51.100.1', '192.0.2.80'),
+        ):
+            self.place(host, 'example.com', 'SOA', message(address, 'REFUSED', 'qr', []))
+            self.place(host, 'example.com', 'SOA__rd', message(address, 'NOERROR', 'qr aa rd', [soa]))
+            self.place(host, 'example.com', 'AXFR__rd', message(address, 'NOTIMP', 'qr aa', []))
+            self.place(host, 'example.com', 'A__rd', message(
+                address, 'NOERROR', 'qr aa rd', [f'example.com. 300 IN A {address_a}'],
+            ))
+        result = self.command(
+            'example.com', '--old', 'ns1.old.test', '--new', 'ns1.new.test',
+            '--no-delegation', '--no-resolvers', '--plain',
+        )
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn('example.com A differs.', result.stdout)
+        self.assertNotIn('refused the zone', result.stdout)
+
+    def test_recursive_answer_without_authority_is_not_the_zone(self):
+        soa = 'example.com. 3600 IN SOA ns1.old.test. host.example.com. 1 1 1 1 1'
+        for host, address in (('ns1.old.test', '192.0.2.1'), ('ns1.new.test', '198.51.100.1')):
+            self.place(host, 'example.com', 'SOA', message(address, 'REFUSED', 'qr', []))
+            self.place(host, 'example.com', 'SOA__rd', message(address, 'NOERROR', 'qr rd ra', [soa]))
+        result = self.command(
+            'example.com', '--old', 'ns1.old.test', '--new', 'ns1.new.test',
+            '--no-delegation', '--no-resolvers', '--plain',
+        )
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn('ns1.old.test refused the zone at 192.0.2.1.', result.stdout)
+        self.assertIn('No records were read from the nameservers.', result.stdout)
+        self.assertNotIn('SOA 1', result.stdout)
+
     def test_trace_and_review_stay_with_dig(self):
         (self.fixture / 'trace_example.com').write_text(
             '. 100 IN NS a.root-servers.net.\n'
@@ -313,7 +355,7 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Installed NS Cross-check', result.stdout)
             version = subprocess.run([str(bindir / 'ns-crosscheck'), '--version'], check=False, capture_output=True, text=True)
-            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.1')
+            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.2')
             again = subprocess.run(
                 [sys.executable, str(ROOT / 'install.py'), '--from-dir', str(ROOT), '--bin-dir', str(bindir)],
                 check=False, capture_output=True, text=True,

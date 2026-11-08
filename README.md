@@ -129,8 +129,9 @@ A names file is one name per line. Text after `#` is a comment. `--types`
 limits the types asked when a transfer is unavailable. `--no-axfr` skips the
 transfer. `--port` and `--timeout` are passed through to `dig`. The default
 port is 53 and the default wait is 3 seconds. Options in `~/.digrc` are
-ignored. A query that is refused or does not answer over UDP is tried again
-over TCP.
+ignored. A query that is refused or does not answer is tried again over TCP,
+and then with recursion. A recursive answer is used only when the server marks
+it authoritative.
 
 `--no-delegation` skips `dig +trace`. `--no-resolvers` skips the three public
 resolvers. Those lookups describe the move. The exit status follows the

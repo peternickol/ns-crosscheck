@@ -35,7 +35,7 @@ import subprocess
 import sys
 
 APP_ID = 'ns-crosscheck'
-VERSION = '0.1.1'
+VERSION = '0.1.2'
 MIN_PYTHON = (3, 10)
 MAX_NAMES = 2000
 RESOLVERS = (('1.1.1.1', '1.1.1.1'), ('8.8.8.8', '8.8.8.8'), ('9.9.9.9', '9.9.9.9'))
@@ -82,6 +82,8 @@ class Server:
     aa: bool = False
     elapsed_ms: int | None = None
     tcp: bool = False
+    rd: bool = False
+    extra: tuple = ()
     records: dict = field(default_factory=dict)
 
 
@@ -202,16 +204,19 @@ def dig_timeout(timeout):
     return max(1, int(timeout))
 
 
-# -r ignores ~/.digrc. Cookies and DNSSEC are left off so an authoritative
-# server sees an ordinary query. +yaml stays last among the stable options.
-_DIG_OPTS = ('+noidnin', '+noidnout', '+nocookie', '+nodnssec', '-r')
-_RETRY = {'timeout', 'error', 'unreachable', 'REFUSED', 'FORMERR', 'SERVFAIL'}
-
-
-def _status_of(outcome):
-    if isinstance(outcome[0], str):
-        return outcome[0]
-    return outcome[0][0]
+# -r ignores ~/.digrc. DNSSEC is left off so the query stays ordinary.
+# +yaml is added by the query, after any transport options.
+_DIG_OPTS = ('+noidnin', '+noidnout', '+nodnssec', '-r')
+# UDP without recursion, then TCP, then the same with recursion. A recursive
+# answer is kept only when the server sets the authoritative bit.
+_PLANS = (
+    (False, False, ()),
+    (True, False, ()),
+    (False, True, ()),
+    (True, True, ()),
+    (False, True, ('+noedns',)),
+    (True, True, ('+noedns',)),
+)
 
 
 def run_dig(args, timeout, limit):
@@ -236,9 +241,9 @@ def run_dig(args, timeout, limit):
     return text, None, result.returncode
 
 
-def query(host, name, rtype, timeout, port, rd, tcp=False):
+def query(host, name, rtype, timeout, port, rd, tcp=False, extra=()):
     seconds = dig_timeout(timeout)
-    args = [f'@{host}', '-p', str(port), name, rtype, f'+timeout={seconds}', '+tries=1', *_DIG_OPTS, '+yaml']
+    args = [f'@{host}', '-p', str(port), name, rtype, f'+timeout={seconds}', '+tries=1', *_DIG_OPTS, *extra, '+yaml']
     if tcp:
         args.append('+tcp')
     if not rd:
@@ -360,6 +365,11 @@ def parse_trace(text, zone):
         if names and found is None:
             found = (tuple(sorted(set(names))), tuple(sorted(set(ds))))
     if found is None:
+        low = text.lower()
+        if 'refused' in low:
+            return Delegation(error='The parent servers refused the query.')
+        if 'timed out' in low or 'no servers could be reached' in low:
+            return Delegation(error='The parent servers did not answer.')
         return Delegation(error='The parent response had no referral.')
     return Delegation(names=found[0], ds=found[1])
 
@@ -442,15 +452,30 @@ def load_side(hosts, zone, domain, label, axfr, timeout, port):
     return [probe(host, domain, axfr, timeout, port) for host in hosts]
 
 
+def _authoritative_soa(outcome, require_aa):
+    if isinstance(outcome[0], str):
+        return False
+    (status, flags), answers, _authority, _address, _elapsed = outcome
+    if status != 'NOERROR' or not any(item[2] == 'SOA' for item in answers):
+        return False
+    if require_aa and 'aa' not in flags.split():
+        return False
+    return True
+
+
 def probe(host, domain, axfr, timeout, port):
-    outcome = query(host, domain, 'SOA', timeout, port, rd=False)
-    tcp = False
-    # A firewall or an anycast node can refuse UDP and still answer TCP.
-    if _status_of(outcome) in _RETRY:
-        alt = query(host, domain, 'SOA', timeout, port, rd=False, tcp=True)
-        if _status_of(alt) not in _RETRY:
-            outcome = alt
-            tcp = True
+    outcome = None
+    tcp, rd, extra = False, False, ()
+    for tcp_try, rd_try, extra_try in _PLANS:
+        tried = query(host, domain, 'SOA', timeout, port, rd=rd_try, tcp=tcp_try, extra=extra_try)
+        if outcome is None:
+            outcome = tried
+        # Recursion is accepted only from an authoritative answer. A firewall
+        # that answers the query itself does not set that bit.
+        if _authoritative_soa(tried, require_aa=rd_try):
+            outcome = tried
+            tcp, rd, extra = tcp_try, rd_try, extra_try
+            break
     if isinstance(outcome[0], str):
         failure, _answers, _authority, address, elapsed = outcome
         return Server(host, address, failure, _failure_detail(failure), elapsed_ms=elapsed)
@@ -459,7 +484,8 @@ def probe(host, domain, axfr, timeout, port):
         code = 'nodata' if status == 'NOERROR' else _status_code(status)
         return Server(host, address, code, _failure_detail(code), elapsed_ms=elapsed)
     server = Server(
-        host, address, 'answered', '', aa='aa' in flags.split(), elapsed_ms=elapsed, tcp=tcp,
+        host, address, 'answered', '', aa='aa' in flags.split(), elapsed_ms=elapsed,
+        tcp=tcp, rd=rd, extra=extra,
     )
     if axfr:
         moved = transfer(host, domain, timeout, port, tcp=tcp)
@@ -555,7 +581,10 @@ def fill(servers, domain, extra, configured, timeout, port):
                 for rtype in _types_for(name, origin, configured, servers):
                     if (name, rtype) in server.records:
                         continue
-                    outcome = query(server.host, display_name(name), rtype, timeout, port, rd=False, tcp=server.tcp)
+                    outcome = query(
+                        server.host, display_name(name), rtype, timeout, port,
+                        rd=server.rd, tcp=server.tcp, extra=server.extra,
+                    )
                     _store(server, name, rtype, outcome)
                     rr = server.records.get((name, rtype))
                     if rr and rr.data:
@@ -599,7 +628,10 @@ def _store(server, name, rtype, outcome):
     if isinstance(outcome[0], str):
         server.records[(name, rtype)] = RRset(error=_failure_detail(outcome[0]))
         return
-    (status, _flags), answers, _authority, _address, _elapsed = outcome
+    (status, flags), answers, _authority, _address, _elapsed = outcome
+    if server.rd and 'aa' not in flags.split():
+        server.records[(name, rtype)] = RRset(error='answered without the authoritative bit')
+        return
     if status not in ('NOERROR', 'NXDOMAIN'):
         server.records[(name, rtype)] = RRset(error=_failure_detail(_status_code(status)))
         return
@@ -927,6 +959,8 @@ def _server_finding(server, domain):
 
 def _coverage(old, new, names, capped, mode):
     count = len(names)
+    if count == 0:
+        return 'No records were read from the nameservers.'
     cap = ' The name list reached its limit.' if capped else ''
     old_complete = any(server.complete for server in old if server.status in ('answered', 'zone file'))
     new_complete = any(server.complete for server in new if server.status in ('answered', 'zone file'))
