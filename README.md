@@ -4,7 +4,7 @@
 
 <h1 align="center">NS Cross-check</h1>
 
-<p align="center"><strong>See whether a zone matches on the nameservers you are leaving and the ones you are moving to.</strong></p>
+<p align="center"><strong>List a domain's DNS records, or see whether they match across a nameserver move.</strong></p>
 
 <p align="center">
   MIT licensed. A wrapper around dig. Python 3.10 or newer.
@@ -15,6 +15,8 @@
   &nbsp;·&nbsp;
   <a href="#install">Install</a>
   &nbsp;·&nbsp;
+  <a href="#list">List</a>
+  &nbsp;·&nbsp;
   <a href="#check">Check</a>
   &nbsp;·&nbsp;
   <a href="#review">Review</a>
@@ -22,19 +24,23 @@
   <a href="#license">License</a>
 </p>
 
-NS Cross-check runs `dig` against the old nameservers and the new nameservers,
-then prints the records that differ. The terminal uses the same colors as a
-diff: cyan headings, red for the old value, green for the new value, yellow
-for a note.
+NS Cross-check lists the DNS records for a domain. Pass `--old` and `--new`
+and it compares those records on the nameservers you are leaving and the ones
+you are moving to. The terminal uses the same colors as a diff: cyan
+headings, red for the old value, green for the new value, yellow for a note.
 
 ```text
+ns-crosscheck example.com
 ns-crosscheck example.com --old ns1.old.net --old ns2.old.net --new ns1.new.net --new ns2.new.net
 ```
 
-A matching record means those `dig` answers were the same. The delegation
-section is `dig +trace`: what the registry publishes. The resolver section is
-what 1.1.1.1, 8.8.8.8, and 9.9.9.9 answer. A parent or a public resolver that
-still has the old names is reported. That lag leaves the exit status unchanged.
+A domain by itself reads the nameservers the registry publishes and prints
+the records, one type at a time. A comparison prints each old value beside
+the new one. A matching record means those `dig` answers were the same. The
+delegation section of a comparison is `dig +trace`: what the registry
+publishes. The resolver section is what 1.1.1.1, 8.8.8.8, and 9.9.9.9 answer.
+A parent or a public resolver that still has the old names is reported. That
+lag leaves the exit status unchanged.
 
 ## Install
 
@@ -85,6 +91,68 @@ Tested on Linux with Python 3.13 and BIND 9.20 `dig`. macOS is expected to
 work where `dig` is installed, and has not been verified here. Native Windows
 installation is not supported; use WSL.
 
+## List
+
+```bash
+ns-crosscheck example.com
+```
+
+A domain alone lists that domain's records. `--plain`, `--color`, `--json`,
+`--timeout`, and `--port` can be added. `--old`, `--new`, a zone file,
+`--names`, `--types`, `--review`, `--no-axfr`, `--strict-ttl`,
+`--no-delegation`, or `--no-resolvers` runs a comparison instead.
+
+`dig +trace` finds the nameservers the registry delegates to, and the records
+are read from those servers. The report is split by type. Each row is a name,
+a TTL, and the record data. A long value, such as a DKIM key or a SOA record,
+is printed in full on the next line.
+
+A zone transfer supplies every record. When the transfer is refused, the
+command asks for the apex and for ordinary names, and the last line says that
+other records may exist. The footer names the servers that answered.
+
+`ns-crosscheck example.com --plain` prints a report of this shape. It exits 0
+when the records were read. It exits 1 when a nameserver does not answer or
+the nameservers disagree. It exits 2 when the registry's nameservers cannot
+be found.
+
+```text
+example.com
+
+Records
+
+  A
+    name              ttl   data
+    example.com       3600  192.0.2.10
+    mail.example.com  3600  192.0.2.25
+    www.example.com   3600  192.0.2.10
+
+  TXT
+    name         ttl   data
+    example.com  3600  "v=spf1 -all"
+
+  MX
+    name         ttl   data
+    example.com  3600  10 mail.example.com.
+
+  NS
+    name         ttl   data
+    example.com  3600  ns1.dns.test.
+    example.com  3600  ns2.dns.test.
+
+  SOA
+    name         ttl   data
+    example.com  3600
+      data  ns1.dns.test. hostmaster.example.com. 1 7200 3600 1209600 3600
+
+Read from ns1.dns.test, ns2.dns.test.
+
+Listed 3 names from a zone transfer.
+```
+
+`--json` prints the same records as one object. A listing does not query
+1.1.1.1, 8.8.8.8, or 9.9.9.9.
+
 ## Check
 
 ```text
@@ -97,19 +165,18 @@ ns-crosscheck DOMAIN [--old HOST]... [--new HOST]...
                      [--plain] [--color]
 ```
 
+Pass `--old`, `--new`, or a zone file to compare two copies of the domain.
 Each side is a list of hosts or one zone file. A host is passed to `dig` as
 `@host`. The query is `+norecurse`, so the answer is the one that server
 holds. The report shows the address `dig` reached and how long the SOA query
 took.
 
-A domain by itself lists the records on the nameservers the registry
-delegates to. Pass `--old` or `--new` to compare two sets of records. Leave
-`--old` out of a comparison and `dig +trace` supplies the current nameservers.
+Leave `--old` out of a comparison and `dig +trace` supplies the current nameservers.
 
 ```bash
+ns-crosscheck example.com
 ns-crosscheck example.com --old ns1.old.net --old ns2.old.net --new ns1.new.net --new ns2.new.net
 ns-crosscheck example.com --old-zone old.zone --new ns1.new.net
-ns-crosscheck example.com
 ns-crosscheck --demo
 ```
 
@@ -122,8 +189,8 @@ CNAME, SRV, and SOA records. It follows those names for two rounds and stops
 at 2,000 names. When neither side transfers, it also asks for ordinary names:
 `www`, `mail`, `ftp`, `cdn`, `cart`, `orders`, `control`, `admin`, `mailer`,
 `mta-sts`, `_dmarc`, and the usual Google, Microsoft, and Mailchimp DKIM
-names. When both sides are incomplete, the coverage line says that other
-records may exist.
+names. When a transfer is incomplete, the last line says that other records
+may exist. A listing says `Listed`. A comparison says `Checked`.
 
 A names file is one name per line. Text after `#` is a comment. `--types`
 limits the types asked when a transfer is unavailable. `--no-axfr` skips the
@@ -137,8 +204,10 @@ the route selected by a packet mark in `ip rule` when this process is allowed
 to set that mark. When it is not, the command asks for your password and
 continues with permission to set the mark.
 
-`--no-delegation` skips `dig +trace`. `--no-resolvers` skips the three public
-resolvers. Those lookups describe the move. The exit status follows the
+`--no-delegation` skips `dig +trace`. A bare domain uses that lookup to find
+its nameservers, so pass `--old` or `--old-zone` together with
+`--no-delegation`. `--no-resolvers` skips the three public resolvers on a
+comparison. Those lookups describe the move. The exit status follows the
 record comparison.
 
 Color is on when stdout is a terminal. `NO_COLOR` and `--plain` turn it off.
@@ -164,12 +233,13 @@ A TTL difference is a note. `--strict-ttl` makes it a flaw. Notes alone exit 0.
 If one side never answers, its records stay unchecked.
 
 The records section is split by type, so A, AAAA, and TXT stay apart from MX
-and NS. Within a type, each old value lines up with the same value on the new
-side. When the values differ, they share a row. A long value, such as a DKIM
-key, is printed in full on the next line so every character can be copied.
-Copy lists zone-file lines for data that is on the old side and absent from
-the new side. NS and SOA are left out of that list. Paste a Copy line into
-the new nameserver.
+and NS. A listing has one `data` column. A comparison lines each old value up
+with the same value on the new side, under `old` and `new`. When the values
+differ, they share a row. A long value, such as a DKIM key, is printed in
+full on the next line so every character can be copied. Copy, printed only
+for a comparison, lists zone-file lines for data that is on the old side and
+absent from the new side. NS and SOA are left out of that list. Paste a Copy
+line into the new nameserver.
 
 ### Built-in example
 

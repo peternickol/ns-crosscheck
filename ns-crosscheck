@@ -41,7 +41,7 @@ import subprocess
 import sys
 
 APP_ID = 'ns-crosscheck'
-VERSION = '0.1.12'
+VERSION = '0.1.13'
 MIN_PYTHON = (3, 10)
 MAX_NAMES = 2000
 RESOLVERS = (('1.1.1.1', '1.1.1.1'), ('8.8.8.8', '8.8.8.8'), ('9.9.9.9', '9.9.9.9'))
@@ -59,9 +59,9 @@ RANK = {'error': 0, 'differ': 1, 'only-old': 2, 'only-new': 3, 'note': 4, 'match
 
 EXAMPLES = """
 examples:
+  ns-crosscheck example.com
   ns-crosscheck example.com --old ns1.old.net --old ns2.old.net --new ns1.new.net --new ns2.new.net
   ns-crosscheck example.com --old-zone old.zone --new ns1.new.net
-  ns-crosscheck example.com
   ns-crosscheck --demo
 """
 
@@ -2084,11 +2084,11 @@ def _listing(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog='ns-crosscheck',
-        description='Compare a DNS zone on the nameservers you are moving from and to, using dig.',
+        description="List a domain's DNS records, or compare them on the nameservers you are moving from and to, using dig.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=EXAMPLES,
     )
-    parser.add_argument('domain', nargs='?', help='Zone to compare, such as example.com')
+    parser.add_argument('domain', nargs='?', help='Domain to list, or the zone to compare, such as example.com')
     parser.add_argument('--old', action='append', default=[], metavar='HOST', help='Nameserver being moved away from')
     parser.add_argument('--new', action='append', default=[], metavar='HOST', help='Nameserver being moved to')
     parser.add_argument('--old-zone', metavar='FILE', help='Zone file for the old side, read with named-compilezone')
