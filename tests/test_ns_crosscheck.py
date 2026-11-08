@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import pty
 import stat
 import struct
 import subprocess
@@ -153,7 +154,7 @@ class ToolTest(unittest.TestCase):
         self.assertIn('\033[31m', colored.stdout)
         self.assertIn('\033[32m', colored.stdout)
         version = self.command('--version', path='/usr/bin')
-        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.5')
+        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.6')
 
     def test_dig_transfer_reports_the_move(self):
         self.place('ns1.old.test', 'example.com', 'SOA', message(
@@ -380,6 +381,41 @@ class ToolTest(unittest.TestCase):
             else:
                 module.os.environ['NSC_ELEVATED'] = saved_elevated
 
+    def test_the_command_asks_for_the_sudo_password(self):
+        sudo_bin = self.root / 'sudo-bin'
+        sudo_bin.mkdir()
+        sudo = sudo_bin / 'sudo'
+        sudo.write_text('#!/usr/bin/env python3\nimport sys\nsys.stdout.write("\\n".join(sys.argv) + "\\n")\n')
+        sudo.chmod(sudo.stat().st_mode | stat.S_IEXEC)
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.environ['PATH'] = str(sudo_bin) + os.pathsep + os.environ.get('PATH', '')
+            os.environ.pop('NSC_ELEVATED', None)
+            os.environ.pop('NSC_FIXTURE', None)
+            module = types.ModuleType('nsc_elev')
+            sys.modules[module.__name__] = module
+            exec(compile(PROGRAM.read_text(encoding='utf-8'), str(PROGRAM), 'exec'), module.__dict__)
+            module.sys.argv = [str(PROGRAM), 'example.com', '--old', 'ns1.old.test']
+            module._maybe_elevate()
+            os._exit(3)
+        _pid, status = os.waitpid(pid, 0)
+        chunks = []
+        while True:
+            try:
+                piece = os.read(fd, 4096)
+            except OSError:
+                break
+            if not piece:
+                break
+            chunks.append(piece)
+        os.close(fd)
+        text = b''.join(chunks).decode()
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0, text)
+        self.assertIn('[ns-crosscheck] password for %p: ', text)
+        self.assertIn('NSC_ELEVATED=1', text)
+        self.assertIn(str(PROGRAM), text)
+        self.assertIn('example.com', text)
+
     def test_trace_and_review_stay_with_dig(self):
         (self.fixture / 'trace_example.com').write_text(
             '. 100 IN NS a.root-servers.net.\n'
@@ -426,7 +462,7 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Installed NS Cross-check', result.stdout)
             version = subprocess.run([str(bindir / 'ns-crosscheck'), '--version'], check=False, capture_output=True, text=True)
-            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.5')
+            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.6')
             again = subprocess.run(
                 [sys.executable, str(ROOT / 'install.py'), '--from-dir', str(ROOT), '--bin-dir', str(bindir)],
                 check=False, capture_output=True, text=True,

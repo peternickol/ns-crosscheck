@@ -134,9 +134,8 @@ and then with recursion. A recursive answer is used only when the server marks
 it authoritative. A non-recursive reply with the recursion-available bit set came from a
 resolver on the path. The command tries IPv6, and on Linux it retries through
 the route selected by a packet mark in `ip rule` when this process is allowed
-to set that mark. Otherwise it reruns itself with `sudo` and the program's
-full path. `sudo ns-crosscheck` does not see a program installed in
-`~/.local/bin`.
+to set that mark. When it is not, the command asks for your password and
+continues with permission to set the mark.
 
 `--no-delegation` skips `dig +trace`. `--no-resolvers` skips the three public
 resolvers. Those lookups describe the move. The exit status follows the

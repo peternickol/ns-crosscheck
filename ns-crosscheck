@@ -41,7 +41,7 @@ import subprocess
 import sys
 
 APP_ID = 'ns-crosscheck'
-VERSION = '0.1.5'
+VERSION = '0.1.6'
 MIN_PYTHON = (3, 10)
 MAX_NAMES = 2000
 RESOLVERS = (('1.1.1.1', '1.1.1.1'), ('8.8.8.8', '8.8.8.8'), ('9.9.9.9', '9.9.9.9'))
@@ -284,16 +284,16 @@ def query(host, name, rtype, timeout, port, rd, tcp=False, extra=()):
     outcome = _dig_query(host, name, rtype, timeout, port, rd, tcp, extra, ipv6=_ipv6)
     if not _path_answered(outcome, rd):
         return outcome
+    mark = _activate_mark(timeout)
+    if mark is not None:
+        return _direct_query(host, name, rtype, timeout, port, rd, tcp, mark)
     if not _ipv6 and not _ipv6_tried:
         _ipv6_tried = True
         alt = _dig_query(host, name, rtype, timeout, port, rd, tcp, extra, ipv6=True)
         if _authoritative_soa(alt, require_aa=True):
             _ipv6 = True
             return alt
-    mark = _activate_mark(timeout)
-    if mark is None:
-        return outcome
-    return _direct_query(host, name, rtype, timeout, port, rd, tcp, mark)
+    return outcome
 
 
 def transfer(host, name, timeout, port, tcp=False):
@@ -430,23 +430,32 @@ def _sudo_command():
     return ' '.join(shlex.quote(part) for part in ('sudo', program, *sys.argv[1:]))
 
 
-def _maybe_elevate():
-    """Re-run this program under sudo by absolute path.
+def _terminal():
+    try:
+        fd = os.open('/dev/tty', os.O_RDWR)
+    except OSError:
+        return False
+    os.close(fd)
+    return True
 
-    sudo's secure_path does not include ~/.local/bin, so `sudo ns-crosscheck`
-    cannot see an install there.
+
+def _maybe_elevate():
+    """Ask for the sudo password and continue as the same command.
+
+    sudo's secure_path does not include ~/.local/bin, so the program is passed
+    by its full path.
     """
     if os.environ.get('NSC_ELEVATED') or os.environ.get('NSC_FIXTURE'):
         return False
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
+    if not _terminal():
         return False
     sudo = shutil.which('sudo')
     program = _program_path()
     if not sudo or not program or not os.path.isfile(program):
         return False
-    print('Reaching the nameservers needs a routing mark this user cannot set.', file=sys.stderr)
+    prompt = '[ns-crosscheck] password for %p: '
     try:
-        os.execv(sudo, [sudo, 'NSC_ELEVATED=1', program, *sys.argv[1:]])
+        os.execv(sudo, [sudo, '-p', prompt, 'NSC_ELEVATED=1', program, *sys.argv[1:]])
     except OSError:
         return False
     return False
