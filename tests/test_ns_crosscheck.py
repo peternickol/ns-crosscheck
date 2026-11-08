@@ -154,7 +154,7 @@ class ToolTest(unittest.TestCase):
         self.assertIn('\033[31m', colored.stdout)
         self.assertIn('\033[32m', colored.stdout)
         version = self.command('--version', path='/usr/bin')
-        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.9')
+        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.10')
 
     def test_dig_transfer_reports_the_move(self):
         self.place('ns1.old.test', 'example.com', 'SOA', message(
@@ -227,17 +227,19 @@ class ToolTest(unittest.TestCase):
             '--no-delegation', '--no-resolvers', '--plain',
         )
         self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
-        self.assertIn(f'    old  {old_txt}', result.stdout)
-        self.assertIn(f'    new  {new_txt}', result.stdout)
-        self.assertIn(f'    old  {match}', result.stdout)
-        self.assertIn(f'    new  {match}', result.stdout)
+        self.assertIn(f'      old  {old_txt}', result.stdout)
+        self.assertIn(f'      new  {new_txt}', result.stdout)
+        self.assertIn(f'      old  {match}', result.stdout)
+        self.assertIn(f'      new  {match}', result.stdout)
+        positions = [result.stdout.index(f'\n  {label}\n') for label in ('A', 'TXT', 'NS', 'SOA')]
+        self.assertEqual(positions, sorted(positions))
         self.assertNotIn(old_txt[:39] + '...', result.stdout)
         self.assertNotIn(new_txt[:39] + '...', result.stdout)
         self.assertNotIn(match[:39] + '...', result.stdout)
         self.assertIn(f'google._domainkey.example.com. 3600 IN TXT {old_txt}', result.stdout)
         copy = result.stdout.split('Copy', 1)[1]
         self.assertNotIn('selector._domainkey.example.com.', copy)
-        short = next(line for line in result.stdout.splitlines() if '192.0.2.10' in line and ' A ' in line)
+        short = next(line for line in result.stdout.splitlines() if '192.0.2.10' in line and 'IN A' not in line)
         self.assertIn('192.0.2.10', short)
         self.assertLess(len(short), 160)
         self.assertNotIn('old  ', short)
@@ -553,7 +555,7 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Installed NS Cross-check', result.stdout)
             version = subprocess.run([str(bindir / 'ns-crosscheck'), '--version'], check=False, capture_output=True, text=True)
-            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.9')
+            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.10')
             again = subprocess.run(
                 [sys.executable, str(ROOT / 'install.py'), '--from-dir', str(ROOT), '--bin-dir', str(bindir)],
                 check=False, capture_output=True, text=True,

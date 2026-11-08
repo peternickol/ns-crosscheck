@@ -163,7 +163,8 @@ The command exits 1 when `dig` shows any of these:
 A TTL difference is a note. `--strict-ttl` makes it a flaw. Notes alone exit 0.
 If one side never answers, its records stay unchecked.
 
-The records section lines each old value up with the same value on the new
+The records section is split by type, so A, AAAA, and TXT stay apart from MX
+and NS. Within a type, each old value lines up with the same value on the new
 side. When the values differ, they share a row. A long value, such as a DKIM
 key, is printed in full on the next line so every character can be copied.
 Copy lists zone-file lines for data that is on the old side and absent from
@@ -187,13 +188,24 @@ New
   ns2.new.test  198.51.100.2  refused the zone
 
 Records
-  name                  type   ttl       old                                  new
-  example.com           MX     3600      10 mail.example.com.                 (none)
-  example.com           TXT    3600      "v=spf1 include:_spf.old.test -all"  "v=spf1 include:_spf.new.test -all"
-  www.example.com       A      3600      192.0.2.10                           192.0.2.80
-  calendar.example.com  CNAME  3600/300  ghs.googlehosted.com.                ghs.googlehosted.com.
-  _dmarc.example.com    TXT    300       "v=DMARC1; p=none;"                  "v=DMARC1; p=none;"
-  mail.example.com      A      3600      192.0.2.25                           192.0.2.25
+
+  A
+    name              ttl   old         new
+    mail.example.com  3600  192.0.2.25  192.0.2.25
+    www.example.com   3600  192.0.2.10  192.0.2.80
+
+  CNAME
+    name                  ttl       old                    new
+    calendar.example.com  3600/300  ghs.googlehosted.com.  ghs.googlehosted.com.
+
+  TXT
+    name                ttl   old                                  new
+    example.com         3600  "v=spf1 include:_spf.old.test -all"  "v=spf1 include:_spf.new.test -all"
+    _dmarc.example.com  300   "v=DMARC1; p=none;"                  "v=DMARC1; p=none;"
+
+  MX
+    name         ttl   old                   new
+    example.com  3600  10 mail.example.com.  (none)
 
 Copy
   example.com. 3600 IN MX 10 mail.example.com.

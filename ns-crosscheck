@@ -41,7 +41,7 @@ import subprocess
 import sys
 
 APP_ID = 'ns-crosscheck'
-VERSION = '0.1.9'
+VERSION = '0.1.10'
 MIN_PYTHON = (3, 10)
 MAX_NAMES = 2000
 RESOLVERS = (('1.1.1.1', '1.1.1.1'), ('8.8.8.8', '8.8.8.8'), ('9.9.9.9', '9.9.9.9'))
@@ -1733,37 +1733,62 @@ def _value(label, values, code, color):
 # A DKIM or DNSSEC value is longer than a column. It is printed whole on the
 # next line, and it does not widen the other rows, so the key can be copied.
 _CELL_INLINE = 42
+# Address and text data, then mail, then the nameserver records. Anything else follows.
+_TYPE_ORDER = ('A', 'AAAA', 'CNAME', 'TXT', 'MX', 'NS', 'SOA')
+
+
+def _type_rank(rtype):
+    try:
+        return 0, _TYPE_ORDER.index(rtype)
+    except ValueError:
+        return 1, rtype
 
 
 def _table(report, color):
-    rows = list(_table_rows(report))
-    if not rows:
+    grouped = {}
+    for row in _table_rows(report):
+        grouped.setdefault(row[1], []).append(row)
+    if not grouped:
         return []
+    lines = ['', paint('Records', '1;36', color)]
+    apex = display_name(report.domain)
+    for rtype in sorted(grouped, key=_type_rank):
+        lines.append('')
+        lines.append('  ' + paint(rtype, '1;36', color))
+        lines.extend(_type_table(grouped[rtype], report, color, apex))
+    return lines
+
+
+def _type_table(rows, report, color, apex):
     solo = report.solo or report.mode == 'consistency'
     shown = []
-    for name, rtype, ttl, old, new, status in rows:
+    for name, _rtype, ttl, old, new, status in rows:
         old_text = old or '(none)'
         new_text = new or '(none)'
         long = len(old_text) > _CELL_INLINE or (not solo and len(new_text) > _CELL_INLINE)
-        shown.append((name, rtype, ttl, old_text, new_text, status, long))
+        shown.append((name, ttl, old_text, new_text, status, long))
+    shown.sort(key=lambda row: (row[0] != apex, row[0]))
     name_w = max(len('name'), *(len(row[0]) for row in shown))
-    type_w = max(len('type'), *(len(row[1]) for row in shown))
-    ttl_w = max(len('ttl'), *(len(row[2]) for row in shown))
+    ttl_w = max(len('ttl'), *(len(row[1]) for row in shown))
     value_label = 'data' if solo else 'old'
-    old_w = max(len(value_label), *(len(row[3]) for row in shown if not row[6]))
-    new_w = 0 if solo else max(len('new'), *(len(row[4]) for row in shown if not row[6]))
-    head = f'  {"name".ljust(name_w)}  {"type".ljust(type_w)}  {"ttl".ljust(ttl_w)}  {value_label.ljust(old_w)}'
+    short_rows = [row for row in shown if not row[5]]
+    old_w = max(len(value_label), *(len(row[2]) for row in short_rows)) if short_rows else len(value_label)
+    if solo or not short_rows:
+        new_w = 0 if solo else len('new')
+    else:
+        new_w = max(len('new'), *(len(row[3]) for row in short_rows))
+    head = f'    {"name".ljust(name_w)}  {"ttl".ljust(ttl_w)}  {value_label.ljust(old_w)}'
     if not solo:
         head += f'  {"new".ljust(new_w)}'
-    lines = ['', paint('Records', '1;36', color), head.rstrip()]
-    for name, rtype, ttl, old, new, status, long in shown:
+    lines = [head.rstrip()]
+    for name, ttl, old, new, status, long in shown:
         old_code, new_code = _row_colors(status)
-        prefix = f'  {name.ljust(name_w)}  {rtype.ljust(type_w)}  {ttl.ljust(ttl_w)}'
+        prefix = f'    {name.ljust(name_w)}  {ttl.ljust(ttl_w)}'
         if long:
             lines.append(prefix.rstrip())
-            lines.append('    ' + paint(f'{value_label}  {old}', old_code, color and bool(old_code)))
+            lines.append('      ' + paint(f'{value_label}  {old}', old_code, color and bool(old_code)))
             if not solo:
-                lines.append('    ' + paint(f'new  {new}', new_code, color and bool(new_code)))
+                lines.append('      ' + paint(f'new  {new}', new_code, color and bool(new_code)))
             continue
         body = prefix + '  ' + _painted_cell(old, old_w, old_code, color)
         if not solo:
