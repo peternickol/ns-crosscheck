@@ -154,7 +154,7 @@ class ToolTest(unittest.TestCase):
         self.assertIn('\033[31m', colored.stdout)
         self.assertIn('\033[32m', colored.stdout)
         version = self.command('--version', path='/usr/bin')
-        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.7')
+        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.8')
 
     def test_dig_transfer_reports_the_move(self):
         self.place('ns1.old.test', 'example.com', 'SOA', message(
@@ -189,6 +189,57 @@ class ToolTest(unittest.TestCase):
         self.assertEqual(review.returncode, 1, review.stderr)
         self.assertIn('dig @198.51.100.1 www.example.com A +norecurse', review.stdout)
         self.assertNotIn('\n> ', '\n' + review.stdout)
+
+    def test_a_long_txt_is_printed_in_full(self):
+        key = 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA' + ('ab' * 40)
+        old_txt = f'"v=DKIM1; k=rsa; p={key}old"'
+        new_txt = f'"v=DKIM1; k=rsa; p={key}new"'
+        match = f'"v=DKIM1; k=rsa; p={key}same"'
+        self.assertGreater(len(old_txt), 42)
+        self.assertNotEqual(old_txt[:39] + '...', old_txt)
+        old_zone = zone(
+            'example.com. 3600 IN SOA ns1.old.test. host.example.com. 10 1 1 1 1',
+            'example.com. 3600 IN NS ns1.old.test.',
+            'example.com. 3600 IN A 192.0.2.10',
+            f'google._domainkey.example.com. 3600 IN TXT {old_txt}',
+            f'selector._domainkey.example.com. 3600 IN TXT {match}',
+        )
+        new_zone = zone(
+            'example.com. 3600 IN SOA ns1.old.test. host.example.com. 10 1 1 1 1',
+            'example.com. 3600 IN NS ns1.old.test.',
+            'example.com. 3600 IN A 192.0.2.10',
+            f'google._domainkey.example.com. 3600 IN TXT {new_txt}',
+            f'selector._domainkey.example.com. 3600 IN TXT {match}',
+        )
+        self.place('ns1.old.test', 'example.com', 'SOA', message(
+            '192.0.2.1', 'NOERROR', 'qr aa',
+            ['example.com. 3600 IN SOA ns1.old.test. host.example.com. 10 1 1 1 1'],
+        ))
+        self.place('ns1.old.test', 'example.com', 'AXFR', message('192.0.2.1', 'NOERROR', 'qr aa', old_zone.splitlines()))
+        self.place('ns1.new.test', 'example.com', 'SOA', message(
+            '198.51.100.1', 'NOERROR', 'qr aa',
+            ['example.com. 3600 IN SOA ns1.old.test. host.example.com. 10 1 1 1 1'],
+        ))
+        self.place('ns1.new.test', 'example.com', 'AXFR', message('198.51.100.1', 'NOERROR', 'qr aa', new_zone.splitlines()))
+        result = self.command(
+            'example.com', '--old', 'ns1.old.test', '--new', 'ns1.new.test',
+            '--no-delegation', '--no-resolvers', '--plain',
+        )
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn(f'    old  {old_txt}', result.stdout)
+        self.assertIn(f'    new  {new_txt}', result.stdout)
+        self.assertIn(f'    old  {match}', result.stdout)
+        self.assertIn(f'    new  {match}', result.stdout)
+        self.assertNotIn(old_txt[:39] + '...', result.stdout)
+        self.assertNotIn(new_txt[:39] + '...', result.stdout)
+        self.assertNotIn(match[:39] + '...', result.stdout)
+        self.assertIn(f'google._domainkey.example.com. 3600 IN TXT {old_txt}', result.stdout)
+        copy = result.stdout.split('Copy', 1)[1]
+        self.assertNotIn('selector._domainkey.example.com.', copy)
+        short = next(line for line in result.stdout.splitlines() if '192.0.2.10' in line and ' A ' in line)
+        self.assertIn('192.0.2.10', short)
+        self.assertLess(len(short), 160)
+        self.assertNotIn('old  ', short)
 
     def test_a_silent_server_is_not_a_missing_record(self):
         self.place('ns1.old.test', 'example.com', 'SOA', message(
@@ -465,7 +516,7 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Installed NS Cross-check', result.stdout)
             version = subprocess.run([str(bindir / 'ns-crosscheck'), '--version'], check=False, capture_output=True, text=True)
-            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.7')
+            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.8')
             again = subprocess.run(
                 [sys.executable, str(ROOT / 'install.py'), '--from-dir', str(ROOT), '--bin-dir', str(bindir)],
                 check=False, capture_output=True, text=True,

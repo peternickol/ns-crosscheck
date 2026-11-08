@@ -164,9 +164,11 @@ A TTL difference is a note. `--strict-ttl` makes it a flaw. Notes alone exit 0.
 If one side never answers, its records stay unchecked.
 
 The records section lines each old value up with the same value on the new
-side. When the values differ, they share a row. Copy lists zone-file lines for
-data that is on the old side and absent from the new side. NS and SOA are left
-out of that list. Paste a Copy line into the new nameserver.
+side. When the values differ, they share a row. A long value, such as a DKIM
+key, is printed in full on the next line so every character can be copied.
+Copy lists zone-file lines for data that is on the old side and absent from
+the new side. NS and SOA are left out of that list. Paste a Copy line into
+the new nameserver.
 
 ### Built-in example
 

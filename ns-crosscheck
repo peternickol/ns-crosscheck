@@ -41,7 +41,7 @@ import subprocess
 import sys
 
 APP_ID = 'ns-crosscheck'
-VERSION = '0.1.7'
+VERSION = '0.1.8'
 MIN_PYTHON = (3, 10)
 MAX_NAMES = 2000
 RESOLVERS = (('1.1.1.1', '1.1.1.1'), ('8.8.8.8', '8.8.8.8'), ('9.9.9.9', '9.9.9.9'))
@@ -1692,28 +1692,44 @@ def _value(label, values, code, color):
     return paint(f'{label}  {body}', code, color and bool(code))
 
 
+# A DKIM or DNSSEC value is longer than a column. It is printed whole on the
+# next line, and it does not widen the other rows, so the key can be copied.
+_CELL_INLINE = 42
+
+
 def _table(report, color):
     rows = list(_table_rows(report))
     if not rows:
         return []
     solo = report.solo or report.mode == 'consistency'
-    name_w = max(len('name'), *(len(row[0]) for row in rows))
-    type_w = max(len('type'), *(len(row[1]) for row in rows))
-    ttl_w = max(len('ttl'), *(len(row[2]) for row in rows))
-    old_w = max(len('data' if solo else 'old'), *(len(_clip(row[3], 42)) for row in rows))
-    new_w = 0 if solo else max(len('new'), *(len(_clip(row[4], 42)) for row in rows))
+    shown = []
+    for name, rtype, ttl, old, new, status in rows:
+        old_text = old or '(none)'
+        new_text = new or '(none)'
+        long = len(old_text) > _CELL_INLINE or (not solo and len(new_text) > _CELL_INLINE)
+        shown.append((name, rtype, ttl, old_text, new_text, status, long))
+    name_w = max(len('name'), *(len(row[0]) for row in shown))
+    type_w = max(len('type'), *(len(row[1]) for row in shown))
+    ttl_w = max(len('ttl'), *(len(row[2]) for row in shown))
     value_label = 'data' if solo else 'old'
+    old_w = max(len(value_label), *(len(row[3]) for row in shown if not row[6]))
+    new_w = 0 if solo else max(len('new'), *(len(row[4]) for row in shown if not row[6]))
     head = f'  {"name".ljust(name_w)}  {"type".ljust(type_w)}  {"ttl".ljust(ttl_w)}  {value_label.ljust(old_w)}'
     if not solo:
         head += f'  {"new".ljust(new_w)}'
     lines = ['', paint('Records', '1;36', color), head.rstrip()]
-    for name, rtype, ttl, old, new, status in rows:
+    for name, rtype, ttl, old, new, status, long in shown:
         old_code, new_code = _row_colors(status)
-        shown_old = _clip(old, 42)
-        body = f'  {name.ljust(name_w)}  {rtype.ljust(type_w)}  {ttl.ljust(ttl_w)}  '
-        body += _painted_cell(shown_old, old_w, old_code, color)
+        prefix = f'  {name.ljust(name_w)}  {rtype.ljust(type_w)}  {ttl.ljust(ttl_w)}'
+        if long:
+            lines.append(prefix.rstrip())
+            lines.append('    ' + paint(f'{value_label}  {old}', old_code, color and bool(old_code)))
+            if not solo:
+                lines.append('    ' + paint(f'new  {new}', new_code, color and bool(new_code)))
+            continue
+        body = prefix + '  ' + _painted_cell(old, old_w, old_code, color)
         if not solo:
-            body += '  ' + _painted_cell(_clip(new, 42), new_w, new_code, color)
+            body += '  ' + _painted_cell(new, new_w, new_code, color)
         lines.append(body.rstrip())
     return lines
 
@@ -1767,13 +1783,6 @@ def _row_colors(status):
     if status == 'note':
         return '33', '33'
     return '', ''
-
-
-def _clip(text, width):
-    body = text or '(none)'
-    if len(body) <= width:
-        return body
-    return body[:width - 3] + '...'
 
 
 def _painted_cell(text, width, code, color):
