@@ -153,7 +153,7 @@ class ToolTest(unittest.TestCase):
         self.assertIn('\033[31m', colored.stdout)
         self.assertIn('\033[32m', colored.stdout)
         version = self.command('--version', path='/usr/bin')
-        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.3')
+        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.4')
 
     def test_dig_transfer_reports_the_move(self):
         self.place('ns1.old.test', 'example.com', 'SOA', message(
@@ -324,6 +324,25 @@ class ToolTest(unittest.TestCase):
         self.assertNotIn('refused the zone', result.stdout)
         self.assertIn('No records were read from the nameservers.', result.stdout)
 
+    def test_a_denied_mark_leaves_later_lookups_on_dig(self):
+        for host, address in (('ns1.old.test', '192.0.2.1'), ('ns1.new.test', '198.51.100.1')):
+            self.place(host, 'example.com', 'SOA', message(address, 'REFUSED', 'qr ra', []))
+        for address in ('1.1.1.1', '8.8.8.8', '9.9.9.9'):
+            self.place(address, 'example.com', 'NS', message(
+                address, 'NOERROR', 'qr rd ra', ['example.com. 30 IN NS ns1.new.test.'],
+            ))
+        result = self.command(
+            'example.com', '--old', 'ns1.old.test', '--new', 'ns1.new.test',
+            '--no-delegation', '--plain',
+        )
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn('1.1.1.1 answers with the new nameservers.', result.stdout)
+        self.assertNotIn('is unreachable', result.stdout)
+        self.assertNotIn('did not answer', result.stdout)
+        calls = (self.fixture / 'calls').read_text()
+        self.assertIn('@1.1.1.1 -p 53 example.com NS', calls)
+        self.assertIn('@ns1.new.test -p 53 example.com SOA', calls)
+
     def test_dns_parser_reads_an_authoritative_soa(self):
         module = types.ModuleType('nscrosscheck_under_test')
         sys.modules[module.__name__] = module
@@ -391,7 +410,7 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Installed NS Cross-check', result.stdout)
             version = subprocess.run([str(bindir / 'ns-crosscheck'), '--version'], check=False, capture_output=True, text=True)
-            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.3')
+            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.4')
             again = subprocess.run(
                 [sys.executable, str(ROOT / 'install.py'), '--from-dir', str(ROOT), '--bin-dir', str(bindir)],
                 check=False, capture_output=True, text=True,

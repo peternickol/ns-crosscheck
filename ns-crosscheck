@@ -40,7 +40,7 @@ import subprocess
 import sys
 
 APP_ID = 'ns-crosscheck'
-VERSION = '0.1.3'
+VERSION = '0.1.4'
 MIN_PYTHON = (3, 10)
 MAX_NAMES = 2000
 RESOLVERS = (('1.1.1.1', '1.1.1.1'), ('8.8.8.8', '8.8.8.8'), ('9.9.9.9', '9.9.9.9'))
@@ -222,9 +222,10 @@ _PLANS = (
     (False, True, ('+noedns',)),
     (True, True, ('+noedns',)),
 )
-# None: not tried. False: unavailable. An int is the packet mark that reaches
-# the nameserver when a resolver on this path answers in its place.
+# None until a routing mark is in use. False is not a mark: bool is a subclass
+# of int, and a failed setsockopt(SO_MARK, 0) would hide every later lookup.
 _direct_mark = None
+_direct_blocked = False
 _mark_denied = False
 _ipv6 = False
 _ipv6_tried = False
@@ -271,9 +272,13 @@ def run_dig(args, timeout, limit):
     return text, None, result.returncode
 
 
+def _using_direct():
+    return _direct_mark is not None
+
+
 def query(host, name, rtype, timeout, port, rd, tcp=False, extra=()):
     global _ipv6, _ipv6_tried
-    if isinstance(_direct_mark, int):
+    if _using_direct():
         return _direct_query(host, name, rtype, timeout, port, rd, tcp or rtype == 'AXFR', _direct_mark)
     outcome = _dig_query(host, name, rtype, timeout, port, rd, tcp, extra, ipv6=_ipv6)
     if not _path_answered(outcome, rd):
@@ -291,14 +296,14 @@ def query(host, name, rtype, timeout, port, rd, tcp=False, extra=()):
 
 
 def transfer(host, name, timeout, port, tcp=False):
-    if isinstance(_direct_mark, int):
+    if _using_direct():
         return _direct_transfer(host, name, timeout, port, _direct_mark)
     return _dig_query(host, name, 'AXFR', timeout, port, True, tcp, (), ipv6=_ipv6, limit=60)
 
 
 def trace(name, timeout):
     global _ipv6, _ipv6_tried
-    if isinstance(_direct_mark, int):
+    if _using_direct():
         return _direct_trace(name, timeout)
     parsed, text = _trace(name, timeout, tcp=False, ipv6=_ipv6)
     redirected = _trace_redirected(text)
@@ -410,19 +415,19 @@ def _can_mark(mark):
 
 
 def _activate_mark(timeout):
-    global _direct_mark, _mark_denied
-    if isinstance(_direct_mark, int):
+    global _direct_mark, _direct_blocked, _mark_denied
+    if _direct_mark is not None:
         return _direct_mark
-    if _direct_mark is False or os.environ.get('NSC_FIXTURE'):
-        _direct_mark = False
+    if _direct_blocked or os.environ.get('NSC_FIXTURE'):
+        _direct_blocked = True
         return None
     marks = _routing_marks()
     if not marks:
-        _direct_mark = False
+        _direct_blocked = True
         return None
     if not _can_mark(marks[0]):
         _mark_denied = True
-        _direct_mark = False
+        _direct_blocked = True
         return None
     for mark in marks:
         for root in _ROOTS[:3]:
@@ -430,7 +435,7 @@ def _activate_mark(timeout):
             if _direct_reached(outcome):
                 _direct_mark = mark
                 return mark
-    _direct_mark = False
+    _direct_blocked = True
     return None
 
 
@@ -1163,6 +1168,8 @@ def _assemble(config, domain, mode, old, new, delegation, capped):
             findings.append(finding)
         elif server.status == 'answered' and not server.aa:
             findings.append(Finding('flaw', f'{server.host} answered without the authoritative bit.'))
+    if _mark_denied:
+        findings.append(Finding('flaw', 'This process cannot set the routing mark that would reach those nameservers. Run the command with sudo.'))
     old_ref = _reference(old)
     new_ref = _reference(new)
     findings.extend(_within(old, old_ref))
@@ -1428,8 +1435,7 @@ def _server_finding(server, domain):
         'timeout': f'{host} did not answer{where}.',
         'unreachable': f'{host} is unreachable{where}.',
         'refused': f'{host} refused the zone{where}.',
-        'redirected': f'{host} was not reached{where}. A resolver on this path answered.'
-        + (' This process cannot set the routing mark that would avoid it. Run the command with sudo.' if _mark_denied else ''),
+        'redirected': f'{host} was not reached{where}. A resolver on this path answered.',
         'servfail': f'{host} does not serve {shown} (SERVFAIL).',
         'nxdomain': f'{host} has no zone for {shown}.',
         'notauth': f'{host} is not authoritative for {shown}.',
