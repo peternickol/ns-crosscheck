@@ -1,0 +1,1341 @@
+#!/usr/bin/env python3
+"""Compare a DNS zone on two nameservers by running dig."""
+# MIT License
+#
+# Copyright (c) 2026 Peter Nickol
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+APP_ID = 'ns-crosscheck'
+VERSION = '0.1.0'
+MIN_PYTHON = (3, 10)
+MAX_NAMES = 2000
+RESOLVERS = (('1.1.1.1', '1.1.1.1'), ('8.8.8.8', '8.8.8.8'), ('9.9.9.9', '9.9.9.9'))
+APEX_TYPES = ('A', 'AAAA', 'CAA', 'DNSKEY', 'MX', 'NS', 'SOA', 'TXT')
+NAME_TYPES = ('A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT')
+# Asked only when neither side will transfer the zone. These are the names a
+# move usually cares about, not a scan of the namespace.
+COMMON_LABELS = (
+    'www', 'mail', 'ftp', 'cdn', 'cart', 'orders', 'control', 'admin', 'mailer', 'mta-sts',
+    '_dmarc', 'google._domainkey', 'selector1._domainkey', 'selector2._domainkey',
+    'k1._domainkey', 'k2._domainkey', 'k3._domainkey', 'default._domainkey',
+)
+TRANSFER_DENIED = ('REFUSED', 'FORMERR', 'NOTIMP', 'NOTAUTH')
+RANK = {'error': 0, 'differ': 1, 'only-old': 2, 'only-new': 3, 'note': 4, 'match': 5, 'unchecked': 6}
+
+EXAMPLES = """
+examples:
+  ns-crosscheck example.com --old ns1.old.net --old ns2.old.net --new ns1.new.net --new ns2.new.net
+  ns-crosscheck example.com --old-zone old.zone --new ns1.new.net
+  ns-crosscheck example.com
+  ns-crosscheck --demo
+"""
+
+
+class Fail(Exception):
+    """A problem to print before exiting 2."""
+
+
+@dataclass
+class RRset:
+    data: tuple = ()
+    ttl: int | None = None
+    error: str | None = None
+
+
+@dataclass
+class Server:
+    host: str
+    address: str
+    status: str
+    detail: str
+    serial: int | None = None
+    complete: bool = False
+    aa: bool = False
+    elapsed_ms: int | None = None
+    records: dict = field(default_factory=dict)
+
+
+@dataclass
+class Finding:
+    severity: str
+    summary: str
+    old: tuple = ()
+    new: tuple = ()
+    old_label: str = 'old'
+    new_label: str = 'new'
+    name: str = ''
+    rtype: str = ''
+
+
+@dataclass
+class TypeRow:
+    rtype: str
+    status: str
+    old: tuple
+    new: tuple
+    old_ttl: int | None
+    new_ttl: int | None
+
+
+@dataclass
+class NameRow:
+    name: str
+    status: str
+    types: list
+
+
+@dataclass
+class Delegation:
+    names: tuple = ()
+    ds: tuple = ()
+    error: str | None = None
+    summary: str = ''
+
+
+@dataclass
+class Resolver:
+    label: str
+    names: tuple = ()
+    error: str | None = None
+    summary: str = ''
+
+
+@dataclass
+class Report:
+    domain: str
+    mode: str
+    old: list
+    new: list
+    findings: list
+    names: list
+    coverage: str
+    ok: bool
+    delegation: Delegation | None = None
+    resolvers: list = field(default_factory=list)
+    old_at: str = ''
+    new_at: str = ''
+    solo: bool = False
+
+
+@dataclass
+class Config:
+    domain: str
+    old_hosts: tuple = ()
+    new_hosts: tuple = ()
+    old_zone: str | None = None
+    new_zone: str | None = None
+    names: tuple = ()
+    types: tuple | None = None
+    axfr: bool = True
+    delegation: bool = True
+    resolvers: bool = True
+    strict_ttl: bool = False
+    timeout: float = 3
+    port: int = 53
+
+
+def normalize_name(name):
+    text = str(name).strip().rstrip('.').casefold()
+    if not text:
+        return '.'
+    labels = []
+    for label in text.split('.'):
+        try:
+            labels.append(label.encode('idna').decode('ascii'))
+        except UnicodeError:
+            labels.append(label)
+    return '.'.join(labels) + '.'
+
+
+def display_name(name):
+    text = name[:-1] if name.endswith('.') else name
+    return text
+
+
+def in_zone(name, zone):
+    name, zone = normalize_name(name), normalize_name(zone)
+    return name == zone or name.endswith('.' + zone)
+
+
+def serial_relation(left, right):
+    """1 when left is newer in the RFC 1982 serial space."""
+    if left == right:
+        return 0
+    return 1 if (left - right) % 4294967296 < 2147483648 else -1
+
+
+def paint(text, code, enabled):
+    return f'\033[{code}m{text}\033[0m' if enabled else text
+
+
+def dig_timeout(timeout):
+    return max(1, int(timeout))
+
+
+def run_dig(args, timeout, limit):
+    if shutil.which('dig') is None:
+        raise Fail('dig is not installed. Install bind9-dnsutils.')
+    try:
+        result = subprocess.run(
+            ['dig', *args], capture_output=True, text=True, timeout=limit,
+        )
+    except subprocess.TimeoutExpired:
+        return '', 'timeout', 9
+    text = result.stdout + result.stderr
+    if result.returncode and '- type: MESSAGE' not in text and ' IN ' not in text:
+        low = text.lower()
+        if 'timed out' in low or 'no servers could be reached' in low:
+            return text, 'timeout', result.returncode
+        if 'connection refused' in low or 'network is unreachable' in low or 'communications error' in low:
+            return text, 'unreachable', result.returncode
+        if "couldn't get address" in low or 'could not get address' in low:
+            return text, 'unresolved', result.returncode
+        return text, 'error', result.returncode
+    return text, None, result.returncode
+
+
+def query(host, name, rtype, timeout, port, rd):
+    seconds = dig_timeout(timeout)
+    args = [f'@{host}', '-p', str(port), name, rtype, f'+timeout={seconds}', '+tries=1', '+noidnin', '+noidnout', '+yaml']
+    if not rd:
+        args.append('+norecurse')
+    text, failure, _code = run_dig(args, timeout, seconds + 15)
+    if failure:
+        return failure, [], [], '', None
+    return parse_message(text)
+
+
+def transfer(host, name, timeout, port):
+    seconds = dig_timeout(timeout)
+    args = [f'@{host}', '-p', str(port), name, 'AXFR', f'+timeout={seconds}', '+tries=1', '+noidnin', '+noidnout', '+yaml']
+    text, failure, _code = run_dig(args, timeout, seconds + 60)
+    if failure:
+        return failure, [], [], '', None
+    return parse_message(text)
+
+
+def trace(name, timeout):
+    seconds = dig_timeout(timeout)
+    args = [name, 'NS', '+trace', '+nodnssec', f'+timeout={seconds}', '+tries=1', '+noidnin', '+noidnout']
+    text, failure, _code = run_dig(args, timeout, seconds + 60)
+    if failure:
+        return Delegation(error='The parent servers did not answer.')
+    return parse_trace(text, name)
+
+
+def parse_message(text):
+    messages = []
+    current = None
+    section = None
+    for raw in text.splitlines():
+        if raw.startswith('- type:'):
+            current = {'status': '', 'flags': '', 'answer': [], 'authority': [], 'address': '', 'query': '', 'response': ''}
+            messages.append(current)
+            section = None
+            continue
+        if current is None:
+            continue
+        stripped = raw.strip()
+        if stripped.startswith('status:'):
+            current['status'] = stripped.split(':', 1)[1].strip()
+        elif stripped.startswith('flags:'):
+            # dig prints message flags first, then an empty EDNS flags line.
+            # Keep the first flags that name the response.
+            value = stripped.split(':', 1)[1].strip()
+            if value and not current['flags']:
+                current['flags'] = value
+        elif stripped.startswith('response_address:'):
+            current['address'] = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+        elif stripped.startswith('query_time:'):
+            current['query'] = stripped.split('timestamp', 1)[-1].strip()
+        elif stripped.startswith('response_time:'):
+            current['response'] = stripped.split('timestamp', 1)[-1].strip()
+        elif stripped.endswith('_SECTION:'):
+            section = stripped[:-1]
+        elif section in ('ANSWER_SECTION', 'AUTHORITY_SECTION') and stripped.startswith('- '):
+            value = _unquote(stripped[2:].strip())
+            record = parse_rr(value)
+            if record:
+                current['answer' if section.startswith('ANSWER') else 'authority'].append(record)
+        elif stripped and not raw.startswith(' '):
+            section = None
+    if not messages:
+        low = text.lower()
+        if 'transfer failed' in low or 'timed out' in low:
+            return 'timeout', [], [], '', None
+        return 'error', [], [], '', None
+    status = next((item['status'] for item in messages if item['status'] and item['status'] != 'NOERROR'), messages[-1]['status'])
+    if any(item['answer'] for item in messages) and any(item['status'] == 'NOERROR' for item in messages):
+        status = 'NOERROR'
+    answers, authority = [], []
+    for item in messages:
+        answers.extend(item['answer'])
+        authority.extend(item['authority'])
+    address = next((item['address'] for item in messages if item['address']), '')
+    elapsed = _elapsed(messages[0]['query'], messages[0]['response'])
+    flags = messages[0]['flags']
+    return (status or 'error', flags), answers, authority, address, elapsed
+
+
+def parse_rr(text):
+    parts = text.split(None, 4)
+    if len(parts) < 5 or parts[2].upper() != 'IN':
+        return None
+    name, ttl, _rclass, rtype, data = parts
+    if not ttl.isdigit():
+        return None
+    return normalize_name(name), int(ttl), rtype.upper(), data
+
+
+def parse_trace(text, zone):
+    zone = normalize_name(zone)
+    found = None
+    for chunk in text.split(';; Received'):
+        names, ds = [], []
+        for line in chunk.splitlines():
+            record = parse_rr(line.split(';', 1)[0].strip())
+            if not record or record[0] != zone:
+                continue
+            if record[2] == 'NS':
+                names.append(record[3].split()[0])
+            elif record[2] == 'DS':
+                ds.append(record[3])
+        if names and found is None:
+            found = (tuple(sorted(set(names))), tuple(sorted(set(ds))))
+    if found is None:
+        return Delegation(error='The parent response had no referral.')
+    return Delegation(names=found[0], ds=found[1])
+
+
+def _unquote(text):
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+        return text[1:-1]
+    return text
+
+
+def _elapsed(query, response):
+    if not query or not response:
+        return None
+    try:
+        start = datetime.fromisoformat(query.replace('Z', '+00:00'))
+        end = datetime.fromisoformat(response.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return max(0, int((end - start).total_seconds() * 1000))
+
+
+def compile_zone(path, origin):
+    file = Path(path)
+    if not file.is_file():
+        raise Fail(f'{path} is not a file.')
+    if shutil.which('named-compilezone') is None:
+        raise Fail('named-compilezone is not installed. Install bind9-utils, or pass the server instead of a zone file.')
+    try:
+        result = subprocess.run(
+            ['named-compilezone', '-q', '-i', 'local', '-k', 'ignore', '-o', '-', origin, str(file)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise Fail(f'named-compilezone did not finish reading {path}.') from None
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout).strip()
+        raise Fail(message or f'named-compilezone could not read {path}.')
+    records = []
+    for line in result.stdout.splitlines():
+        record = parse_rr(line.split(';', 1)[0].strip())
+        if record:
+            records.append(record)
+    if not records:
+        raise Fail(f'{path} has no records.')
+    return records
+
+
+def add_records(server, records):
+    grouped = {}
+    for name, ttl, rtype, data in records:
+        grouped.setdefault((name, rtype), []).append((data, ttl))
+    for key, items in grouped.items():
+        items.sort()
+        ttls = {ttl for _data, ttl in items}
+        server.records[key] = RRset(tuple(data for data, _ttl in items), items[0][1] if len(ttls) == 1 else None)
+
+
+def soa_value(server, domain):
+    rr = server.records.get((normalize_name(domain), 'SOA'))
+    if rr is None or rr.error or not rr.data:
+        return None
+    return rr.data[0]
+
+
+def soa_serial(data):
+    parts = data.split()
+    if len(parts) < 3 or not parts[2].isdigit():
+        return None
+    return int(parts[2])
+
+
+def load_side(hosts, zone, domain, label, axfr, timeout, port):
+    if zone:
+        server = Server(label, 'zone file', 'zone file', '', complete=True, aa=True)
+        add_records(server, compile_zone(zone, domain))
+        server.serial = soa_serial(soa_value(server, domain) or '')
+        count = len({name for name, _rtype in server.records})
+        server.detail = f'{count} names'
+        return [server]
+    return [probe(host, domain, axfr, timeout, port) for host in hosts]
+
+
+def probe(host, domain, axfr, timeout, port):
+    outcome = query(host, domain, 'SOA', timeout, port, rd=False)
+    if isinstance(outcome[0], str):
+        failure, _answers, _authority, address, elapsed = outcome
+        return Server(host, address, failure, _failure_detail(failure), elapsed_ms=elapsed)
+    (status, flags), answers, _authority, address, elapsed = outcome
+    if status != 'NOERROR' or not any(item[2] == 'SOA' for item in answers):
+        code = 'nodata' if status == 'NOERROR' else _status_code(status)
+        return Server(host, address, code, _failure_detail(code), elapsed_ms=elapsed)
+    server = Server(
+        host, address, 'answered', '', aa='aa' in flags.split(), elapsed_ms=elapsed,
+    )
+    if axfr:
+        moved = transfer(host, domain, timeout, port)
+        if not isinstance(moved[0], str):
+            (zone_status, zone_flags), zone_answers, _authority, _address, _elapsed = moved
+            kept, closed = _cut_axfr(zone_answers, domain)
+            if zone_status == 'NOERROR' and closed:
+                add_records(server, kept)
+                server.complete = True
+                server.aa = server.aa or 'aa' in zone_flags.split()
+                server.serial = soa_serial(soa_value(server, domain) or '')
+                server.detail = f'transfer of {len({name for name, _rtype in server.records})} names'
+                return server
+            if zone_status in TRANSFER_DENIED:
+                server.detail = 'transfer refused'
+        elif moved[0] == 'timeout':
+            server.detail = 'transfer failed'
+    add_records(server, [item for item in answers if item[2] == 'SOA'])
+    server.serial = soa_serial(soa_value(server, domain) or '')
+    if not server.detail:
+        server.detail = 'answered'
+    return server
+
+
+def _cut_axfr(records, domain):
+    origin = normalize_name(domain)
+    seen = 0
+    kept = []
+    for record in records:
+        if record[2] == 'SOA' and record[0] == origin:
+            seen += 1
+            if seen == 2:
+                return kept, True
+        kept.append(record)
+    return kept, False
+
+
+def _status_code(status):
+    return {
+        'REFUSED': 'refused', 'SERVFAIL': 'servfail', 'NXDOMAIN': 'nxdomain',
+        'NOTAUTH': 'notauth', 'FORMERR': 'formerr',
+    }.get(status, 'error')
+
+
+def _failure_detail(status):
+    return {
+        'timeout': 'did not answer',
+        'unreachable': 'is unreachable',
+        'unresolved': 'did not resolve',
+        'refused': 'refused the zone',
+        'servfail': 'SERVFAIL',
+        'nxdomain': 'has no zone',
+        'notauth': 'is not authoritative',
+        'formerr': 'rejected the query',
+        'nodata': 'answered with no SOA',
+        'error': 'did not answer',
+    }.get(status, status)
+
+
+def fill(servers, domain, extra, configured, timeout, port):
+    partial = [server for server in servers if server.status == 'answered' and not server.complete]
+    if not partial:
+        return False
+    origin = normalize_name(domain)
+    names = []
+    capped = False
+
+    def take(name):
+        nonlocal capped
+        name = normalize_name(name)
+        if not in_zone(name, origin) or name in names:
+            return
+        if len(names) >= MAX_NAMES:
+            capped = True
+            return
+        names.append(name)
+
+    take(origin)
+    for name in extra:
+        take(name)
+    for server in servers:
+        if server.complete:
+            for name, _rtype in server.records:
+                take(name)
+    if not any(server.complete for server in servers):
+        stem = origin[:-1] if origin.endswith('.') else origin
+        for label in COMMON_LABELS:
+            take(f'{label}.{stem}')
+    for _round in range(2):
+        found = []
+        for server in partial:
+            for name in list(names):
+                for rtype in _types_for(name, origin, configured, servers):
+                    if (name, rtype) in server.records:
+                        continue
+                    outcome = query(server.host, display_name(name), rtype, timeout, port, rd=False)
+                    _store(server, name, rtype, outcome)
+                    rr = server.records.get((name, rtype))
+                    if rr and rr.data:
+                        for candidate in _mentioned(rtype, rr.data, origin):
+                            if candidate not in names and candidate not in found:
+                                found.append(candidate)
+        if not found:
+            break
+        for name in found:
+            take(name)
+    for server in partial:
+        count = len({name for (name, _rtype), rr in server.records.items() if rr.data})
+        if server.detail == 'transfer refused':
+            server.detail = f'transfer refused, answered {count} names'
+        else:
+            server.detail = f'answered {count} names'
+    return capped
+
+
+def _types_for(name, origin, configured, servers):
+    if configured:
+        types = set(configured)
+    else:
+        # A probe stores the SOA before the walk. That single record must not
+        # hide the rest of the apex when the transfer was refused.
+        types = {
+            rtype for server in servers if server.complete
+            for owner, rtype in server.records if owner == name
+        }
+        if not types:
+            types = set(APEX_TYPES if name == origin else NAME_TYPES)
+    if name == origin:
+        types.update(('SOA', 'NS'))
+    else:
+        types.discard('SOA')
+        types.discard('DNSKEY')
+    return tuple(sorted(types))
+
+
+def _store(server, name, rtype, outcome):
+    if isinstance(outcome[0], str):
+        server.records[(name, rtype)] = RRset(error=_failure_detail(outcome[0]))
+        return
+    (status, _flags), answers, _authority, _address, _elapsed = outcome
+    if status not in ('NOERROR', 'NXDOMAIN'):
+        server.records[(name, rtype)] = RRset(error=_failure_detail(_status_code(status)))
+        return
+    matched = [item for item in answers if item[0] == name and item[2] == rtype]
+    ttls = {item[1] for item in matched}
+    ttl = matched[0][1] if matched and len(ttls) == 1 else None
+    server.records[(name, rtype)] = RRset(tuple(sorted(item[3] for item in matched)), ttl)
+
+
+def _mentioned(rtype, data, origin):
+    found = []
+    for item in data:
+        parts = item.split()
+        if rtype in ('NS', 'CNAME', 'PTR') and parts:
+            found.append(parts[0])
+        elif rtype == 'MX' and len(parts) > 1:
+            found.append(parts[1])
+        elif rtype == 'SRV' and len(parts) > 3:
+            found.append(parts[3])
+        elif rtype == 'SOA' and len(parts) > 1:
+            found.extend(parts[:2])
+    return [normalize_name(name) for name in found if in_zone(name, origin)]
+
+
+def check(config):
+    domain = normalize_name(config.domain)
+    shown = display_name(domain)
+    delegation = trace(shown, config.timeout) if config.delegation else None
+    old_hosts = tuple(config.old_hosts)
+    if not old_hosts and not config.old_zone:
+        if delegation is None:
+            raise Fail('Pass --old or --old-zone, or allow the delegation lookup.')
+        if not delegation.names:
+            raise Fail(f'The current nameservers could not be found. {delegation.error or "no nameservers were returned"}')
+        old_hosts = tuple(display_name(name) for name in delegation.names)
+    old = load_side(old_hosts, config.old_zone, shown, 'Old zone', config.axfr, config.timeout, config.port)
+    new = load_side(config.new_hosts, config.new_zone, shown, 'New zone', config.axfr, config.timeout, config.port)
+    mode = 'compare' if config.new_hosts or config.new_zone else 'consistency'
+    capped = fill(old + new, shown, config.names, config.types, config.timeout, config.port)
+    return _assemble(config, domain, mode, old, new, delegation, capped)
+
+
+def _assemble(config, domain, mode, old, new, delegation, capped):
+    findings = []
+    for server in old + new:
+        finding = _server_finding(server, domain)
+        if finding:
+            findings.append(finding)
+        elif server.status == 'answered' and not server.aa:
+            findings.append(Finding('flaw', f'{server.host} answered without the authoritative bit.'))
+    old_ref = _reference(old)
+    new_ref = _reference(new)
+    findings.extend(_within(old, old_ref))
+    findings.extend(_within(new, new_ref))
+    left, right, unchecked = _columns(mode, old, new, old_ref, new_ref)
+    names, content = _names(left, right, domain, config.strict_ttl, unchecked)
+    findings.extend(content)
+    if mode == 'compare' and new_ref and config.new_hosts:
+        finding = _published_ns(new_ref, config.old_hosts, config.new_hosts, domain)
+        if finding:
+            findings.append(finding)
+    glue_server = new_ref if mode == 'compare' and new_ref else old_ref
+    glue_role = 'new' if glue_server is new_ref and mode == 'compare' else 'old'
+    findings.extend(_glue(glue_server, domain, glue_role))
+    if delegation is not None and delegation.ds and new_ref is not None:
+        dnskey = new_ref.records.get((domain, 'DNSKEY'))
+        known = new_ref.complete or (dnskey is not None and not dnskey.error)
+        if known and (dnskey is None or not dnskey.data):
+            findings.append(Finding(
+                'flaw', 'The parent publishes a DS record and the new servers have no DNSKEY.',
+                name=display_name(domain), rtype='DS',
+            ))
+    _describe_delegation(delegation, config.old_hosts, config.new_hosts, mode)
+    resolvers = _resolvers(config, domain) if config.resolvers else []
+    usable = [server for server in old if server.status in ('answered', 'zone file')]
+    report = Report(
+        domain=domain, mode=mode, old=old, new=new, delegation=delegation, resolvers=resolvers,
+        findings=findings, names=names, coverage=_coverage(old, new, names, capped, mode),
+        ok=not any(item.severity == 'flaw' for item in findings),
+        old_at=old_ref.address if old_ref and old_ref.address != 'zone file' else '',
+        new_at=new_ref.address if new_ref and new_ref.address != 'zone file' else '',
+        solo=mode == 'consistency' and len(usable) < 2,
+    )
+    return report
+
+
+def _reference(servers):
+    usable = [server for server in servers if server.status in ('answered', 'zone file') and server.records]
+    if not usable:
+        return None
+    return max(usable, key=lambda server: server.serial or 0)
+
+
+def _columns(mode, old, new, old_ref, new_ref):
+    if mode == 'consistency':
+        others = [server for server in old if server is not old_ref and server.status in ('answered', 'zone file')]
+        return old_ref, (others[0] if others else None), False
+    if old_ref is None or new_ref is None:
+        return old_ref, new_ref, True
+    return old_ref, new_ref, False
+
+
+def _names(old, new, domain, strict_ttl, unchecked):
+    if old is None and new is None:
+        return [], []
+    keys = set(old.records) if old else set()
+    if new:
+        keys |= set(new.records)
+    by_name = {}
+    for name, rtype in keys:
+        by_name.setdefault(name, []).append(rtype)
+    rows, findings = [], []
+    for name in by_name:
+        type_rows, type_findings = [], []
+        for rtype in sorted(by_name[name]):
+            row, found = _type_row(old, new, name, rtype, strict_ttl, unchecked)
+            if row is None:
+                continue
+            type_rows.append(row)
+            type_findings.extend(found)
+        if not type_rows:
+            continue
+        errors = [row for row in type_rows if row.status == 'error']
+        if len(errors) == len(type_rows) and type_findings:
+            reason = type_findings[0].summary.rsplit(' returned ', 1)[-1]
+            if all(item.summary.endswith(reason) for item in type_findings):
+                findings.append(Finding('flaw', f'{display_name(name)} returned {reason}', name=display_name(name)))
+            else:
+                findings.extend(type_findings)
+        else:
+            findings.extend(type_findings)
+        status = min((row.status for row in type_rows), key=lambda item: RANK.get(item, 9))
+        rows.append(NameRow(display_name(name), status, type_rows))
+    rows.sort(key=lambda row: (normalize_name(row.name) != domain, RANK.get(row.status, 9), row.name))
+    return rows, findings
+
+
+def _type_row(old, new, name, rtype, strict_ttl, unchecked):
+    left = _state(old, name, rtype)
+    right = _state(new, name, rtype)
+    shown = display_name(name)
+    if new is None and not unchecked:
+        if left[0] != 'data':
+            return None, []
+        return TypeRow(rtype, 'match', left[1], (), left[2], None), []
+    if unchecked:
+        if left[0] == 'data':
+            return TypeRow(rtype, 'unchecked', left[1], (), left[2], None), []
+        if right[0] == 'data':
+            return TypeRow(rtype, 'unchecked', (), right[1], None, right[2]), []
+        return None, []
+    if 'unknown' in (left[0], right[0]):
+        return None, []
+    if left[0] == 'error' or right[0] == 'error':
+        reason = left[3] if left[0] == 'error' else right[3]
+        return TypeRow(rtype, 'error', left[1], right[1], left[2], right[2]), [
+            Finding('flaw', f'{shown} {rtype} returned {reason}', name=shown, rtype=rtype),
+        ]
+    if rtype == 'SOA' and left[0] == 'data' and right[0] == 'data':
+        return _soa_row(shown, name, left, right)
+    if left[0] == 'data' and right[0] == 'data' and left[1] == right[1]:
+        if left[2] is not None and right[2] is not None and left[2] != right[2]:
+            severity = 'flaw' if strict_ttl else 'note'
+            status = 'differ' if strict_ttl else 'note'
+            return TypeRow(rtype, status, left[1], right[1], left[2], right[2]), [Finding(
+                severity, f'{shown} {rtype} TTL is {left[2]} on the old servers and {right[2]} on the new servers.',
+                name=shown, rtype=rtype,
+            )]
+        return TypeRow(rtype, 'match', left[1], right[1], left[2], right[2]), []
+    if left[0] == 'data' and right[0] == 'absent':
+        return TypeRow(rtype, 'only-old', left[1], (), left[2], None), [Finding(
+            'flaw', f'{shown} {rtype} is only on the old servers.', left[1], (), name=shown, rtype=rtype,
+        )]
+    if left[0] == 'absent' and right[0] == 'data':
+        return TypeRow(rtype, 'only-new', (), right[1], None, right[2]), [Finding(
+            'flaw', f'{shown} {rtype} is only on the new servers.', (), right[1], name=shown, rtype=rtype,
+        )]
+    if left[0] == 'absent' and right[0] == 'absent':
+        return None, []
+    return TypeRow(rtype, 'differ', left[1], right[1], left[2], right[2]), [Finding(
+        'flaw', f'{shown} {rtype} differs.', left[1], right[1], name=shown, rtype=rtype,
+    )]
+
+
+def _soa_row(shown, name, left, right):
+    old, new = left[1][0], right[1][0]
+    findings = []
+    status = 'match'
+    old_serial, new_serial = soa_serial(old), soa_serial(new)
+    if old_serial is not None and new_serial is not None and old_serial != new_serial:
+        relation = serial_relation(new_serial, old_serial)
+        if relation < 0:
+            findings.append(Finding('flaw', f'The new serial {new_serial} is behind the old serial {old_serial}.', name=shown, rtype='SOA'))
+            status = 'differ'
+        else:
+            findings.append(Finding('note', f'The new serial {new_serial} is ahead of the old serial {old_serial}.', name=shown, rtype='SOA'))
+            status = 'note' if status == 'match' else status
+    old_names, new_names = _soa_names(old), _soa_names(new)
+    if old_names and new_names and old_names != new_names:
+        findings.append(Finding('flaw', f'{shown} SOA primary or contact differs.', (old,), (new,), name=shown, rtype='SOA'))
+        status = 'differ'
+    elif _soa_timers(old) != _soa_timers(new):
+        findings.append(Finding('note', f'{shown} SOA timers differ.', (old,), (new,), name=shown, rtype='SOA'))
+        if status == 'match':
+            status = 'note'
+    if old != new and not findings:
+        findings.append(Finding('flaw', f'{shown} SOA differs.', (old,), (new,), name=shown, rtype='SOA'))
+        status = 'differ'
+    return TypeRow('SOA', status, left[1], right[1], left[2], right[2]), findings
+
+
+def _soa_names(data):
+    parts = data.split()
+    if len(parts) < 2:
+        return ()
+    return normalize_name(parts[0]), normalize_name(parts[1])
+
+
+def _soa_timers(data):
+    return tuple(data.split()[3:7])
+
+
+def _state(server, name, rtype):
+    if server is None:
+        return 'unknown', (), None, None
+    rr = server.records.get((name, rtype))
+    if rr is None:
+        return ('absent', (), None, None) if server.complete else ('unknown', (), None, None)
+    if rr.error:
+        return 'error', (), rr.ttl, rr.error
+    if rr.data:
+        return 'data', rr.data, rr.ttl, None
+    return 'absent', (), rr.ttl, None
+
+
+def _within(servers, reference):
+    if reference is None:
+        return []
+    findings = []
+    for server in servers:
+        if server is reference or server.status not in ('answered', 'zone file'):
+            continue
+        for name, rtype in sorted(set(reference.records) | set(server.records)):
+            left, right = _state(reference, name, rtype), _state(server, name, rtype)
+            if 'unknown' in (left[0], right[0]) or 'error' in (left[0], right[0]) or left[1] == right[1]:
+                continue
+            if rtype == 'SOA' and left[0] == 'data' and right[0] == 'data':
+                old_serial, new_serial = soa_serial(left[1][0]), soa_serial(right[1][0])
+                if old_serial != new_serial and _soa_names(left[1][0]) == _soa_names(right[1][0]):
+                    findings.append(Finding(
+                        'flaw', f'{server.host} serial {new_serial} does not match {reference.host} serial {old_serial}.',
+                        name=display_name(name), rtype='SOA',
+                    ))
+                    continue
+            findings.append(Finding(
+                'flaw', f'{server.host} does not match {reference.host} for {display_name(name)} {rtype}.',
+                left[1], right[1], reference.host, server.host, display_name(name), rtype,
+            ))
+    return findings
+
+
+def _published_ns(server, old_hosts, new_hosts, domain):
+    published = server.records.get((domain, 'NS'))
+    if published is None or published.error or not published.data:
+        return None
+    expected = tuple(sorted(_host_names(new_hosts)))
+    if not expected:
+        return None
+    got = tuple(sorted(normalize_name(item.split()[0]) for item in published.data))
+    if got == expected:
+        return None
+    got_text = ', '.join(display_name(name) for name in got)
+    expected_text = ', '.join(display_name(name) for name in expected)
+    old_names = tuple(sorted(_host_names(old_hosts)))
+    if old_names and got == old_names:
+        summary = f'The new servers still publish the old nameserver names ({got_text}).'
+    else:
+        summary = f'The new servers publish {got_text} instead of {expected_text}.'
+    return Finding('flaw', summary, name=display_name(domain), rtype='NS')
+
+
+def _glue(server, domain, role):
+    if server is None:
+        return []
+    ns = server.records.get((domain, 'NS'))
+    if ns is None or ns.error or not ns.data:
+        return []
+    findings = []
+    for item in ns.data:
+        name = normalize_name(item.split()[0])
+        if not in_zone(name, domain) or name == domain:
+            continue
+        address = server.records.get((name, 'A'))
+        ipv6 = server.records.get((name, 'AAAA'))
+        known = server.complete or address is not None or ipv6 is not None
+        has = (address is not None and address.data) or (ipv6 is not None and ipv6.data)
+        if known and not has:
+            findings.append(Finding(
+                'flaw', f'{display_name(name)} is inside the zone and has no address record on the {role} servers.',
+                name=display_name(name), rtype='A',
+            ))
+    return findings
+
+
+def _server_finding(server, domain):
+    if server.status in ('answered', 'zone file'):
+        return None
+    host = server.host
+    where = f' at {server.address}' if server.address else ''
+    shown = display_name(domain)
+    text = {
+        'unresolved': f'{host} did not resolve.',
+        'timeout': f'{host} did not answer{where}.',
+        'unreachable': f'{host} is unreachable{where}.',
+        'refused': f'{host} refused the zone{where}.',
+        'servfail': f'{host} does not serve {shown} (SERVFAIL).',
+        'nxdomain': f'{host} has no zone for {shown}.',
+        'notauth': f'{host} is not authoritative for {shown}.',
+        'formerr': f'{host} rejected the query{where}.',
+        'nodata': f'{host} answered with no SOA{where}.',
+        'error': f'{host} did not answer{where}.',
+    }.get(server.status, f'{host} {server.detail}.')
+    return Finding('flaw', text)
+
+
+def _coverage(old, new, names, capped, mode):
+    count = len(names)
+    cap = ' The name list reached its limit.' if capped else ''
+    old_complete = any(server.complete for server in old if server.status in ('answered', 'zone file'))
+    new_complete = any(server.complete for server in new if server.status in ('answered', 'zone file'))
+    if mode == 'consistency':
+        if old_complete:
+            return f'Checked {count} names from a zone transfer.{cap}'
+        return f'Checked {count} names by query. A server that refuses a zone transfer can hold other records.{cap}'
+    if old_complete and new_complete:
+        return f'Checked {count} names from zone transfers.{cap}'
+    if old_complete or new_complete:
+        return f'Checked {count} names from the transferred zone. The other side was queried one name at a time.{cap}'
+    if count <= 1:
+        return 'Checked the apex. A server that refuses a zone transfer can hold other records. Pass --names or a zone file to check those too.' + cap
+    return (f'Checked the apex and {count - 1} other names. A server that refuses a zone transfer '
+            f'can hold records this check did not ask for.{cap}')
+
+
+def _describe_delegation(delegation, old_hosts, new_hosts, mode):
+    if delegation is None:
+        return
+    if delegation.error and not delegation.names:
+        delegation.summary = f'Delegation was not checked. {delegation.error}'
+        return
+    relation = _classify(delegation.names, old_hosts, new_hosts)
+    if mode == 'consistency':
+        delegation.summary = 'The registry delegates to these servers.' if relation == 'old' else 'The registry delegates to other servers.'
+        return
+    delegation.summary = {
+        'old': 'The registry still delegates to the old servers.',
+        'new': 'The registry delegates to the new servers.',
+        'mixed': 'The registry delegates to a mix of the old and new servers.',
+        'other': 'The registry delegates to other servers.',
+        'unknown': 'Delegation was not checked.',
+    }[relation]
+
+
+def _resolvers(config, domain):
+    views = []
+    for address, label in RESOLVERS:
+        outcome = query(address, display_name(domain), 'NS', config.timeout, config.port, rd=True)
+        if isinstance(outcome[0], str):
+            view = Resolver(label, error='did not answer')
+        else:
+            (_status, _flags), answers, authority, _address, _elapsed = outcome
+            names = [item[3].split()[0] for item in answers if item[0] == domain and item[2] == 'NS']
+            if not names:
+                names = [item[3].split()[0] for item in authority if item[0] == domain and item[2] == 'NS']
+            view = Resolver(label, names=tuple(sorted(set(names))))
+        _describe_resolver(view, config.old_hosts, config.new_hosts, 'compare' if config.new_hosts or config.new_zone else 'consistency')
+        views.append(view)
+    return views
+
+
+def _describe_resolver(view, old_hosts, new_hosts, mode):
+    if view.error:
+        view.summary = f'{view.label} did not answer.'
+        return
+    relation = _classify(view.names, old_hosts, new_hosts) if view.names else 'unknown'
+    if not view.names:
+        view.summary = f'{view.label} returned no nameservers.'
+    elif mode == 'consistency' and relation == 'old':
+        view.summary = f'{view.label} answers with these servers.'
+    elif relation == 'old':
+        view.summary = f'{view.label} still answers with the old nameservers.'
+    elif relation == 'new':
+        view.summary = f'{view.label} answers with the new nameservers.'
+    elif relation == 'mixed':
+        view.summary = f'{view.label} answers with a mix of the old and new nameservers.'
+    else:
+        view.summary = f'{view.label} answers with {", ".join(display_name(name) for name in view.names)}.'
+
+
+def _classify(names, old_hosts, new_hosts):
+    got = {normalize_name(name) for name in names}
+    old, new = set(_host_names(old_hosts)), set(_host_names(new_hosts))
+    if not got:
+        return 'unknown'
+    if new and got == new:
+        return 'new'
+    if old and got == old:
+        return 'old'
+    if old and new and got & old and got & new:
+        return 'mixed'
+    return 'other'
+
+
+def _host_names(hosts):
+    names = []
+    for host in hosts:
+        text = str(host).strip()
+        if not text or _is_ip(text):
+            continue
+        names.append(normalize_name(text))
+    return tuple(names)
+
+
+def _is_ip(text):
+    body = text[1:-1] if text.startswith('[') and text.endswith(']') else text
+    return body.count('.') == 3 or ':' in body
+
+
+def counts_line(report):
+    if not report.names:
+        return 'No names were compared.'
+    counts = {}
+    for row in report.names:
+        counts[row.status] = counts.get(row.status, 0) + 1
+    parts = [f'{len(report.names)} names.']
+    labels = (
+        ('match', 'matches', 'match'),
+        ('differ', 'differs', 'differ'),
+        ('only-old', 'is only on the old servers', 'are only on the old servers'),
+        ('only-new', 'is only on the new servers', 'are only on the new servers'),
+        ('note', 'has a note', 'have notes'),
+        ('error', 'could not be read', 'could not be read'),
+        ('unchecked', 'was not compared', 'were not compared'),
+    )
+    for key, one, many in labels:
+        count = counts.get(key, 0)
+        if count:
+            parts.append(f'{count} {one if count == 1 else many}.')
+    if len(parts) == 1:
+        parts.append('0 match.')
+    return ' '.join(parts)
+
+
+def render(report, color=False):
+    lines = [paint(display_name(report.domain), '1;36', color), '']
+    if report.mode == 'consistency':
+        lines.extend(_server_block('Current', report.old, color))
+    else:
+        lines.extend(_server_block('Old', report.old, color))
+        if report.new:
+            lines.append('')
+            lines.extend(_server_block('New', report.new, color))
+    if report.delegation is not None:
+        lines.extend(['', paint('Delegation', '1;36', color), f'  {report.delegation.summary}'])
+        for name in report.delegation.names:
+            lines.append(f'  {display_name(name)}')
+    if report.resolvers:
+        lines.extend(['', paint('Resolvers', '1;36', color)])
+        for view in report.resolvers:
+            lines.append(f'  {view.summary}')
+    flaws = [item for item in report.findings if item.severity == 'flaw']
+    notes = [item for item in report.findings if item.severity == 'note']
+    if flaws:
+        lines.extend(['', paint('Flaws', '1;36', color)])
+        for item in flaws:
+            lines.extend(_finding_lines(item, color))
+    else:
+        lines.extend(['', paint('No flaws.', '32', color)])
+    if notes:
+        lines.extend(['', paint('Notes', '1;36', color)])
+        for item in notes:
+            lines.extend(_finding_lines(item, color, '33'))
+    lines.extend(['', report.coverage, counts_line(report), ''])
+    return '\n'.join(lines)
+
+
+def _server_block(title, servers, color):
+    lines = [paint(title, '1;36', color)]
+    if not servers:
+        lines.append('  (none)')
+        return lines
+    for server in servers:
+        place = server.address or ('zone file' if server.status == 'zone file' else '')
+        if server.serial is not None and server.status in ('answered', 'zone file'):
+            text = f'{server.host}  {place}  SOA {server.serial}  {server.detail}'
+        elif place:
+            text = f'{server.host}  {place}  {server.detail}'
+        else:
+            text = f'{server.host}  {server.detail}'
+        if server.elapsed_ms is not None and server.status == 'answered':
+            text += f'  {server.elapsed_ms} ms'
+        lines.append('  ' + text)
+    return lines
+
+
+def _finding_lines(finding, color, code='31'):
+    lines = ['  ' + paint(finding.summary, code, color)]
+    if finding.old or finding.new:
+        own = finding.old_label == 'old' and finding.new_label == 'new'
+        lines.append('    ' + _value(finding.old_label, finding.old, '31' if own else '', color))
+        lines.append('    ' + _value(finding.new_label, finding.new, '32' if own else '', color))
+    return lines
+
+
+def _value(label, values, code, color):
+    body = ', '.join(values) if values else '(none)'
+    return paint(f'{label}  {body}', code, color and bool(code))
+
+
+def to_json(report):
+    return {
+        'domain': display_name(report.domain),
+        'ok': report.ok,
+        'mode': report.mode,
+        'coverage': report.coverage,
+        'counts': counts_line(report),
+        'old_at': report.old_at,
+        'new_at': report.new_at,
+        'servers': {'old': [_server_json(server) for server in report.old], 'new': [_server_json(server) for server in report.new]},
+        'delegation': None if report.delegation is None else {
+            'summary': report.delegation.summary,
+            'names': [display_name(name) for name in report.delegation.names],
+            'ds': list(report.delegation.ds),
+        },
+        'resolvers': [{'label': view.label, 'summary': view.summary, 'names': [display_name(name) for name in view.names]} for view in report.resolvers],
+        'findings': [{
+            'severity': item.severity, 'summary': item.summary, 'name': item.name, 'type': item.rtype,
+            'old': list(item.old), 'new': list(item.new), 'old_label': item.old_label, 'new_label': item.new_label,
+        } for item in report.findings],
+        'names': [{
+            'name': row.name, 'status': row.status,
+            'types': [{'type': item.rtype, 'status': item.status, 'old': list(item.old), 'new': list(item.new),
+                       'old_ttl': item.old_ttl, 'new_ttl': item.new_ttl} for item in row.types],
+        } for row in report.names],
+    }
+
+
+def _server_json(server):
+    return {
+        'host': server.host, 'address': server.address, 'status': server.status, 'detail': server.detail,
+        'serial': server.serial, 'complete': server.complete, 'authoritative': server.aa, 'elapsed_ms': server.elapsed_ms,
+    }
+
+
+def demo_report():
+    def server(host, address, detail, serial=None, status='answered'):
+        return Server(host, address, status, detail, serial, complete=status == 'answered', aa=status == 'answered', elapsed_ms=4 if status == 'answered' else None)
+
+    def row(name, status, types):
+        return NameRow(name, status, types)
+
+    www = TypeRow('A', 'differ', ('192.0.2.10',), ('192.0.2.80',), 3600, 3600)
+    calendar = TypeRow('CNAME', 'note', ('ghs.googlehosted.com.',), ('ghs.googlehosted.com.',), 3600, 300)
+    return Report(
+        domain='example.com.',
+        mode='compare',
+        old=[
+            server('ns1.old.test', '192.0.2.1', 'transfer of 5 names', 2026110701),
+            server('ns2.old.test', '192.0.2.2', 'transfer of 5 names', 2026110701),
+        ],
+        new=[
+            server('ns1.new.test', '198.51.100.1', 'transfer of 5 names', 2026110608),
+            server('ns2.new.test', '198.51.100.2', 'refused the zone', status='refused'),
+        ],
+        delegation=Delegation(
+            ('ns1.old.test.', 'ns2.old.test.'),
+            summary='The registry still delegates to the old servers.',
+        ),
+        resolvers=[
+            Resolver('1.1.1.1', ('ns1.old.test.', 'ns2.old.test.'), summary='1.1.1.1 still answers with the old nameservers.'),
+            Resolver('8.8.8.8', ('ns1.new.test.', 'ns2.new.test.'), summary='8.8.8.8 answers with the new nameservers.'),
+            Resolver('9.9.9.9', ('ns1.old.test.', 'ns2.old.test.'), summary='9.9.9.9 still answers with the old nameservers.'),
+        ],
+        findings=[
+            Finding('flaw', 'ns2.new.test refused the zone at 198.51.100.2.'),
+            Finding('flaw', 'example.com MX is only on the old servers.', ('10 mail.example.com.',), (), name='example.com', rtype='MX'),
+            Finding('flaw', 'The new serial 2026110608 is behind the old serial 2026110701.', name='example.com', rtype='SOA'),
+            Finding('flaw', 'example.com TXT differs.', ('"v=spf1 include:_spf.old.test -all"',), ('"v=spf1 include:_spf.new.test -all"',), name='example.com', rtype='TXT'),
+            Finding('flaw', 'www.example.com A differs.', ('192.0.2.10',), ('192.0.2.80',), name='www.example.com', rtype='A'),
+            Finding('flaw', 'The new servers still publish the old nameserver names (ns1.old.test, ns2.old.test).', name='example.com', rtype='NS'),
+            Finding('note', 'calendar.example.com CNAME TTL is 3600 on the old servers and 300 on the new servers.', name='calendar.example.com', rtype='CNAME'),
+        ],
+        names=[
+            row('example.com', 'differ', []),
+            row('www.example.com', 'differ', [www]),
+            row('calendar.example.com', 'note', [calendar]),
+            row('_dmarc.example.com', 'match', []),
+            row('mail.example.com', 'match', []),
+        ],
+        coverage='Checked 5 names from zone transfers.',
+        ok=False,
+        old_at='192.0.2.1',
+        new_at='198.51.100.1',
+    )
+
+
+def walk(report, color):
+    rows = [row for row in report.names if row.status not in ('match', 'unchecked') and row.types]
+    if not rows:
+        print('Every compared name matches.')
+        return
+    if not sys.stdin.isatty():
+        for row in rows:
+            sys.stdout.write(_name_text(report, row, color) + '\n')
+        return
+    index = 0
+    while True:
+        sys.stdout.write(_name_text(report, row := rows[index], color))
+        print(f'{index + 1} of {len(rows)}. Enter for the next name, p for the previous, q to stop.')
+        try:
+            answer = input('> ').strip().lower()
+        except EOFError:
+            print()
+            return
+        if answer == 'q':
+            return
+        index = (index - 1 if answer == 'p' else index + 1) % len(rows)
+
+
+def _name_text(report, row, color):
+    lines = [paint(row.name, '1;36', color)]
+    for item in row.types:
+        if item.status == 'match':
+            continue
+        lines.append(f'  {item.rtype}')
+        if item.old or item.status in ('only-old', 'differ', 'note', 'unchecked'):
+            lines.append('    ' + _value('old', _ttl(item.old, item.old_ttl), '31', color))
+        if not report.solo and (item.new or item.status in ('only-new', 'differ', 'note')):
+            lines.append('    ' + _value('new', _ttl(item.new, item.new_ttl), '32', color))
+    if report.old_at:
+        rtype = next((item.rtype for item in row.types if item.status != 'match'), 'A')
+        lines.append(f'  dig @{report.old_at} {row.name} {rtype} +norecurse')
+    if report.new_at and report.new_at != report.old_at:
+        rtype = next((item.rtype for item in row.types if item.status != 'match'), 'A')
+        lines.append(f'  dig @{report.new_at} {row.name} {rtype} +norecurse')
+    lines.append('')
+    return '\n'.join(lines)
+
+
+def _ttl(values, ttl):
+    if ttl is None:
+        return values
+    return tuple(f'{value}  TTL {ttl}' for value in values)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog='ns-crosscheck',
+        description='Compare a DNS zone on the nameservers you are moving from and to, using dig.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=EXAMPLES,
+    )
+    parser.add_argument('domain', nargs='?', help='Zone to compare, such as example.com')
+    parser.add_argument('--old', action='append', default=[], metavar='HOST', help='Nameserver being moved away from')
+    parser.add_argument('--new', action='append', default=[], metavar='HOST', help='Nameserver being moved to')
+    parser.add_argument('--old-zone', metavar='FILE', help='Zone file for the old side, read with named-compilezone')
+    parser.add_argument('--new-zone', metavar='FILE', help='Zone file for the new side, read with named-compilezone')
+    parser.add_argument('--names', metavar='FILE', help='Extra names to query, one per line')
+    parser.add_argument('--types', help='Comma-separated types to query when a transfer is refused')
+    parser.add_argument('--timeout', type=float, default=3, help='Seconds to wait for dig (default: 3)')
+    parser.add_argument('--port', type=int, default=53, help='DNS port (default: 53)')
+    parser.add_argument('--no-axfr', action='store_true', help='Query names instead of asking dig for a zone transfer')
+    parser.add_argument('--no-delegation', action='store_true', help='Skip dig +trace')
+    parser.add_argument('--no-resolvers', action='store_true', help='Skip 1.1.1.1, 8.8.8.8, and 9.9.9.9')
+    parser.add_argument('--strict-ttl', action='store_true', help='Treat a TTL difference as a flaw')
+    parser.add_argument('--json', action='store_true', help='Print the report as JSON')
+    parser.add_argument('--review', action='store_true', help='Walk names that are not a clean match')
+    parser.add_argument('--demo', action='store_true', help='Show the built-in example, without running dig')
+    parser.add_argument('--plain', action='store_true', help='Turn color off')
+    parser.add_argument('--color', action='store_true', help='Turn color on')
+    parser.add_argument('--version', action='store_true', help='Print the version and exit')
+    parser.add_argument('--update', action='store_true', help='Update an installed copy from the GitHub repository')
+    args = parser.parse_args(argv)
+    if sys.version_info < MIN_PYTHON:
+        parser.error('Python 3.10 or newer is required.')
+    if args.version:
+        print(f'ns-crosscheck {VERSION}')
+        return 0
+    if args.update:
+        updater = Path(__file__).resolve().with_name('ns-crosscheck-update')
+        if not updater.is_file():
+            parser.error('This copy has no installed updater. Run the installer, or update your source checkout with Git.')
+        raise SystemExit(subprocess.call([sys.executable, str(updater)]))
+    try:
+        report = _report(parser, args)
+    except Fail as error:
+        print(f'ns-crosscheck: {error}', file=sys.stderr)
+        return 2
+    color = _color(args)
+    if args.json:
+        print(json.dumps(to_json(report), indent=2))
+    else:
+        sys.stdout.write(render(report, color))
+        if args.review:
+            walk(report, color)
+    return 0 if report.ok else 1
+
+
+def _report(parser, args):
+    if args.demo:
+        if args.domain or args.old or args.new or args.old_zone or args.new_zone:
+            parser.error('--demo uses the built-in example and takes no zone of its own.')
+        return demo_report()
+    if not args.domain:
+        parser.error('Pass a domain, or --demo.')
+    if args.old and args.old_zone:
+        parser.error('Pass --old or --old-zone for the old side.')
+    if args.new and args.new_zone:
+        parser.error('Pass --new or --new-zone for the new side.')
+    if args.timeout <= 0:
+        parser.error('--timeout must be greater than zero.')
+    if not args.old and not args.old_zone and args.no_delegation:
+        parser.error('Pass --old or --old-zone, or allow the delegation lookup.')
+    types = None
+    if args.types:
+        types = tuple(part.strip().upper() for part in args.types.split(',') if part.strip())
+        if not types:
+            parser.error('--types needs at least one type.')
+    return check(Config(
+        domain=args.domain,
+        old_hosts=tuple(args.old),
+        new_hosts=tuple(args.new),
+        old_zone=args.old_zone,
+        new_zone=args.new_zone,
+        names=_names_file(args.names, args.domain) if args.names else (),
+        types=types,
+        axfr=not args.no_axfr,
+        delegation=not args.no_delegation,
+        resolvers=not args.no_resolvers,
+        strict_ttl=args.strict_ttl,
+        timeout=args.timeout,
+        port=args.port,
+    ))
+
+
+def _names_file(path, domain):
+    file = Path(path)
+    if not file.is_file():
+        raise Fail(f'{path} is not a file.')
+    names = []
+    for line in file.read_text(encoding='utf-8').splitlines():
+        text = line.split('#', 1)[0].strip()
+        if text:
+            names.append(normalize_name(text if '.' in text else f'{text}.{domain}'))
+    return tuple(names)
+
+
+def _color(args):
+    if args.plain or args.json:
+        return False
+    if args.color:
+        return True
+    if os.environ.get('NO_COLOR'):
+        return False
+    return sys.stdout.isatty()
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except BrokenPipeError:
+        raise SystemExit(0)
