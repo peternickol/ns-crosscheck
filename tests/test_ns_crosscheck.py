@@ -154,7 +154,7 @@ class ToolTest(unittest.TestCase):
         self.assertIn('\033[31m', colored.stdout)
         self.assertIn('\033[32m', colored.stdout)
         version = self.command('--version', path='/usr/bin')
-        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.6')
+        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.7')
 
     def test_dig_transfer_reports_the_move(self):
         self.place('ns1.old.test', 'example.com', 'SOA', message(
@@ -173,6 +173,9 @@ class ToolTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
         self.assertIn('www.example.com A differs.', result.stdout)
+        self.assertIn('www.example.com. 3600 IN A 192.0.2.20', result.stdout)
+        self.assertIn('192.0.2.10', result.stdout)
+        self.assertIn('192.0.2.80', result.stdout)
         self.assertIn('The new serial 9 is behind the old serial 10.', result.stdout)
         self.assertIn('The new servers still publish the old nameserver names (ns1.old.test).', result.stdout)
         calls = (self.fixture / 'calls').read_text()
@@ -462,7 +465,7 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Installed NS Cross-check', result.stdout)
             version = subprocess.run([str(bindir / 'ns-crosscheck'), '--version'], check=False, capture_output=True, text=True)
-            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.6')
+            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.7')
             again = subprocess.run(
                 [sys.executable, str(ROOT / 'install.py'), '--from-dir', str(ROOT), '--bin-dir', str(bindir)],
                 check=False, capture_output=True, text=True,

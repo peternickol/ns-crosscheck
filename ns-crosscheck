@@ -41,7 +41,7 @@ import subprocess
 import sys
 
 APP_ID = 'ns-crosscheck'
-VERSION = '0.1.6'
+VERSION = '0.1.7'
 MIN_PYTHON = (3, 10)
 MAX_NAMES = 2000
 RESOLVERS = (('1.1.1.1', '1.1.1.1'), ('8.8.8.8', '8.8.8.8'), ('9.9.9.9', '9.9.9.9'))
@@ -1633,6 +1633,8 @@ def render(report, color=False):
         if report.new:
             lines.append('')
             lines.extend(_server_block('New', report.new, color))
+    lines.extend(_table(report, color))
+    lines.extend(_copy_block(report))
     if report.delegation is not None:
         lines.extend(['', paint('Delegation', '1;36', color), f'  {report.delegation.summary}'])
         for name in report.delegation.names:
@@ -1690,6 +1692,123 @@ def _value(label, values, code, color):
     return paint(f'{label}  {body}', code, color and bool(code))
 
 
+def _table(report, color):
+    rows = list(_table_rows(report))
+    if not rows:
+        return []
+    solo = report.solo or report.mode == 'consistency'
+    name_w = max(len('name'), *(len(row[0]) for row in rows))
+    type_w = max(len('type'), *(len(row[1]) for row in rows))
+    ttl_w = max(len('ttl'), *(len(row[2]) for row in rows))
+    old_w = max(len('data' if solo else 'old'), *(len(_clip(row[3], 42)) for row in rows))
+    new_w = 0 if solo else max(len('new'), *(len(_clip(row[4], 42)) for row in rows))
+    value_label = 'data' if solo else 'old'
+    head = f'  {"name".ljust(name_w)}  {"type".ljust(type_w)}  {"ttl".ljust(ttl_w)}  {value_label.ljust(old_w)}'
+    if not solo:
+        head += f'  {"new".ljust(new_w)}'
+    lines = ['', paint('Records', '1;36', color), head.rstrip()]
+    for name, rtype, ttl, old, new, status in rows:
+        old_code, new_code = _row_colors(status)
+        shown_old = _clip(old, 42)
+        body = f'  {name.ljust(name_w)}  {rtype.ljust(type_w)}  {ttl.ljust(ttl_w)}  '
+        body += _painted_cell(shown_old, old_w, old_code, color)
+        if not solo:
+            body += '  ' + _painted_cell(_clip(new, 42), new_w, new_code, color)
+        lines.append(body.rstrip())
+    return lines
+
+
+def _table_rows(report):
+    solo = report.solo or report.mode == 'consistency'
+    for name_row in report.names:
+        items = sorted(name_row.types, key=lambda item: item.rtype)
+        for item in items:
+            ttl = _ttl_text(item.old_ttl, None if solo else item.new_ttl)
+            pairs = _pairs(item.old, () if solo else item.new)
+            for old, new in pairs:
+                yield (
+                    name_row.name,
+                    item.rtype,
+                    ttl,
+                    old or ('(not read)' if item.status == 'unchecked' and not item.old else '(none)'),
+                    '(not read)' if item.status == 'unchecked' else (new or '(none)'),
+                    item.status,
+                )
+
+
+def _pairs(old, new):
+    left, right = list(old), list(new)
+    pairs = []
+    for value in list(left):
+        if value in right:
+            pairs.append((value, value))
+            left.remove(value)
+            right.remove(value)
+    while left and right:
+        pairs.append((left.pop(0), right.pop(0)))
+    pairs.extend((value, None) for value in left)
+    pairs.extend((None, value) for value in right)
+    return pairs or [(None, None)]
+
+
+def _ttl_text(old_ttl, new_ttl):
+    if old_ttl is None and new_ttl is None:
+        return ''
+    if old_ttl is None:
+        return str(new_ttl)
+    if new_ttl is None or old_ttl == new_ttl:
+        return str(old_ttl)
+    return f'{old_ttl}/{new_ttl}'
+
+
+def _row_colors(status):
+    if status in ('differ', 'only-old', 'only-new'):
+        return '31', '32'
+    if status == 'note':
+        return '33', '33'
+    return '', ''
+
+
+def _clip(text, width):
+    body = text or '(none)'
+    if len(body) <= width:
+        return body
+    return body[:width - 3] + '...'
+
+
+def _painted_cell(text, width, code, color):
+    return paint(text, code, color and bool(code)) + (' ' * (width - len(text)))
+
+
+def _copy_block(report):
+    lines = _copy_lines(report)
+    if not lines:
+        return []
+    return ['', 'Copy', *(f'  {line}' for line in lines)]
+
+
+def _copy_lines(report):
+    if report.solo or report.mode == 'consistency':
+        return []
+    lines = []
+    for name_row in report.names:
+        for item in sorted(name_row.types, key=lambda item: item.rtype):
+            if item.rtype in ('NS', 'SOA') or item.status not in ('only-old', 'differ'):
+                continue
+            present = set(item.new)
+            for value in item.old:
+                if value in present:
+                    continue
+                lines.append(_zone_line(name_row.name, item.old_ttl, item.rtype, value))
+    return lines
+
+
+def _zone_line(name, ttl, rtype, value):
+    owner = name if str(name).endswith('.') else f'{name}.'
+    ttl_text = f'{ttl} ' if ttl is not None else ''
+    return f'{owner} {ttl_text}IN {rtype} {value}'
+
+
 def to_json(report):
     return {
         'domain': display_name(report.domain),
@@ -1715,6 +1834,7 @@ def to_json(report):
             'types': [{'type': item.rtype, 'status': item.status, 'old': list(item.old), 'new': list(item.new),
                        'old_ttl': item.old_ttl, 'new_ttl': item.new_ttl} for item in row.types],
         } for row in report.names],
+        'copy': _copy_lines(report),
     }
 
 
@@ -1734,6 +1854,10 @@ def demo_report():
 
     www = TypeRow('A', 'differ', ('192.0.2.10',), ('192.0.2.80',), 3600, 3600)
     calendar = TypeRow('CNAME', 'note', ('ghs.googlehosted.com.',), ('ghs.googlehosted.com.',), 3600, 300)
+    mx = TypeRow('MX', 'only-old', ('10 mail.example.com.',), (), 3600, None)
+    txt = TypeRow('TXT', 'differ', ('"v=spf1 include:_spf.old.test -all"',), ('"v=spf1 include:_spf.new.test -all"',), 3600, 3600)
+    dmarc = TypeRow('TXT', 'match', ('"v=DMARC1; p=none;"',), ('"v=DMARC1; p=none;"',), 300, 300)
+    mail = TypeRow('A', 'match', ('192.0.2.25',), ('192.0.2.25',), 3600, 3600)
     return Report(
         domain='example.com.',
         mode='compare',
@@ -1764,11 +1888,11 @@ def demo_report():
             Finding('note', 'calendar.example.com CNAME TTL is 3600 on the old servers and 300 on the new servers.', name='calendar.example.com', rtype='CNAME'),
         ],
         names=[
-            row('example.com', 'differ', []),
+            row('example.com', 'differ', [mx, txt]),
             row('www.example.com', 'differ', [www]),
             row('calendar.example.com', 'note', [calendar]),
-            row('_dmarc.example.com', 'match', []),
-            row('mail.example.com', 'match', []),
+            row('_dmarc.example.com', 'match', [dmarc]),
+            row('mail.example.com', 'match', [mail]),
         ],
         coverage='Checked 5 names from zone transfers.',
         ok=False,

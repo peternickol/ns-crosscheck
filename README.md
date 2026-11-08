@@ -163,6 +163,11 @@ The command exits 1 when `dig` shows any of these:
 A TTL difference is a note. `--strict-ttl` makes it a flaw. Notes alone exit 0.
 If one side never answers, its records stay unchecked.
 
+The records section lines each old value up with the same value on the new
+side. When the values differ, they share a row. Copy lists zone-file lines for
+data that is on the old side and absent from the new side. NS and SOA are left
+out of that list. Paste a Copy line into the new nameserver.
+
 ### Built-in example
 
 `ns-crosscheck --demo --plain` prints this report and exits 1. The output
@@ -178,6 +183,20 @@ Old
 New
   ns1.new.test  198.51.100.1  SOA 2026110608  transfer of 5 names  4 ms
   ns2.new.test  198.51.100.2  refused the zone
+
+Records
+  name                  type   ttl       old                                  new
+  example.com           MX     3600      10 mail.example.com.                 (none)
+  example.com           TXT    3600      "v=spf1 include:_spf.old.test -all"  "v=spf1 include:_spf.new.test -all"
+  www.example.com       A      3600      192.0.2.10                           192.0.2.80
+  calendar.example.com  CNAME  3600/300  ghs.googlehosted.com.                ghs.googlehosted.com.
+  _dmarc.example.com    TXT    300       "v=DMARC1; p=none;"                  "v=DMARC1; p=none;"
+  mail.example.com      A      3600      192.0.2.25                           192.0.2.25
+
+Copy
+  example.com. 3600 IN MX 10 mail.example.com.
+  example.com. 3600 IN TXT "v=spf1 include:_spf.old.test -all"
+  www.example.com. 3600 IN A 192.0.2.10
 
 Delegation
   The registry still delegates to the old servers.
