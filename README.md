@@ -155,7 +155,7 @@ The command exits 1 when `dig` shows any of these:
 - A server does not answer, refuses the zone, answers without the authoritative bit, or a resolver on the path answers in its place.
 - Servers on the same side disagree. The copy with the highest SOA serial is the reference. Serial order follows RFC 1982.
 - The new serial is behind the old serial. A new serial that is ahead is a note.
-- The SOA primary name or mailbox differs. Refresh, retry, expire, and minimum differ as a note.
+- The SOA primary name or mailbox differs. The report names the old and new value. Refresh, retry, expire, and minimum differ as a note.
 - The new servers publish nameserver names that still match the old hosts, or that differ from the hosts passed with `--new`.
 - A nameserver inside the zone has no A or AAAA on the new side.
 - The parent publishes a DS record and the new servers have no DNSKEY.

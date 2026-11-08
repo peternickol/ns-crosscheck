@@ -154,7 +154,7 @@ class ToolTest(unittest.TestCase):
         self.assertIn('\033[31m', colored.stdout)
         self.assertIn('\033[32m', colored.stdout)
         version = self.command('--version', path='/usr/bin')
-        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.8')
+        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.9')
 
     def test_dig_transfer_reports_the_move(self):
         self.place('ns1.old.test', 'example.com', 'SOA', message(
@@ -177,6 +177,7 @@ class ToolTest(unittest.TestCase):
         self.assertIn('192.0.2.10', result.stdout)
         self.assertIn('192.0.2.80', result.stdout)
         self.assertIn('The new serial 9 is behind the old serial 10.', result.stdout)
+        self.assertNotIn('SOA contact', result.stdout)
         self.assertIn('The new servers still publish the old nameserver names (ns1.old.test).', result.stdout)
         calls = (self.fixture / 'calls').read_text()
         self.assertIn('@ns1.old.test -p 53 example.com AXFR', calls)
@@ -240,6 +241,42 @@ class ToolTest(unittest.TestCase):
         self.assertIn('192.0.2.10', short)
         self.assertLess(len(short), 160)
         self.assertNotIn('old  ', short)
+
+    def test_a_changed_soa_contact_is_named(self):
+        old_zone = zone(
+            'example.com. 3600 IN SOA ns1.old.test. host.old.example.com. 10 1 1 1 1',
+            'example.com. 3600 IN NS ns1.old.test.',
+            'example.com. 3600 IN A 192.0.2.10',
+        )
+        new_zone = zone(
+            'example.com. 3600 IN SOA ns1.new.test. person.new.example.net. 10 1 1 1 1',
+            'example.com. 3600 IN NS ns1.new.test.',
+            'example.com. 3600 IN A 192.0.2.10',
+        )
+        self.place('ns1.old.test', 'example.com', 'SOA', message(
+            '192.0.2.1', 'NOERROR', 'qr aa',
+            ['example.com. 3600 IN SOA ns1.old.test. host.old.example.com. 10 1 1 1 1'],
+        ))
+        self.place('ns1.old.test', 'example.com', 'AXFR', message('192.0.2.1', 'NOERROR', 'qr aa', old_zone.splitlines()))
+        self.place('ns1.new.test', 'example.com', 'SOA', message(
+            '198.51.100.1', 'NOERROR', 'qr aa',
+            ['example.com. 3600 IN SOA ns1.new.test. person.new.example.net. 10 1 1 1 1'],
+        ))
+        self.place('ns1.new.test', 'example.com', 'AXFR', message('198.51.100.1', 'NOERROR', 'qr aa', new_zone.splitlines()))
+        result = self.command(
+            'example.com', '--old', 'ns1.old.test', '--new', 'ns1.new.test',
+            '--no-delegation', '--no-resolvers', '--plain',
+        )
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn(
+            'example.com SOA primary is ns1.old.test on the old servers and ns1.new.test on the new servers.',
+            result.stdout,
+        )
+        self.assertIn(
+            'example.com SOA contact is host@old.example.com on the old servers and person@new.example.net on the new servers.',
+            result.stdout,
+        )
+        self.assertNotIn('primary or contact differs', result.stdout)
 
     def test_a_silent_server_is_not_a_missing_record(self):
         self.place('ns1.old.test', 'example.com', 'SOA', message(
@@ -516,7 +553,7 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Installed NS Cross-check', result.stdout)
             version = subprocess.run([str(bindir / 'ns-crosscheck'), '--version'], check=False, capture_output=True, text=True)
-            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.8')
+            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.9')
             again = subprocess.run(
                 [sys.executable, str(ROOT / 'install.py'), '--from-dir', str(ROOT), '--bin-dir', str(bindir)],
                 check=False, capture_output=True, text=True,

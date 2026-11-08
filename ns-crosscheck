@@ -41,7 +41,7 @@ import subprocess
 import sys
 
 APP_ID = 'ns-crosscheck'
-VERSION = '0.1.8'
+VERSION = '0.1.9'
 MIN_PYTHON = (3, 10)
 MAX_NAMES = 2000
 RESOLVERS = (('1.1.1.1', '1.1.1.1'), ('8.8.8.8', '8.8.8.8'), ('9.9.9.9', '9.9.9.9'))
@@ -1367,7 +1367,20 @@ def _soa_row(shown, name, left, right):
             status = 'note' if status == 'match' else status
     old_names, new_names = _soa_names(old), _soa_names(new)
     if old_names and new_names and old_names != new_names:
-        findings.append(Finding('flaw', f'{shown} SOA primary or contact differs.', (old,), (new,), name=shown, rtype='SOA'))
+        old_primary, old_contact = old.split(None, 2)[:2]
+        new_primary, new_contact = new.split(None, 2)[:2]
+        if old_names[0] != new_names[0]:
+            findings.append(Finding(
+                'flaw',
+                f'{shown} SOA primary is {display_name(old_primary)} on the old servers and {display_name(new_primary)} on the new servers.',
+                name=shown, rtype='SOA',
+            ))
+        if old_names[1] != new_names[1]:
+            findings.append(Finding(
+                'flaw',
+                f'{shown} SOA contact is {_mailbox(old_contact)} on the old servers and {_mailbox(new_contact)} on the new servers.',
+                name=shown, rtype='SOA',
+            ))
         status = 'differ'
     elif _soa_timers(old) != _soa_timers(new):
         findings.append(Finding('note', f'{shown} SOA timers differ.', (old,), (new,), name=shown, rtype='SOA'))
@@ -1384,6 +1397,31 @@ def _soa_names(data):
     if len(parts) < 2:
         return ()
     return normalize_name(parts[0]), normalize_name(parts[1])
+
+
+def _mailbox(rname):
+    # The first unescaped dot in an SOA rname stands for @.
+    text = str(rname).strip()
+    if text.endswith('.'):
+        text = text[:-1]
+    labels, current, escaped = [], [], False
+    for char in text:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == '\\':
+            escaped = True
+            continue
+        if char == '.':
+            labels.append(''.join(current))
+            current = []
+            continue
+        current.append(char)
+    labels.append(''.join(current))
+    if escaped or len(labels) < 2 or not labels[0] or any(label == '' for label in labels[1:]):
+        return display_name(rname)
+    return f'{labels[0]}@{".".join(labels[1:])}'
 
 
 def _soa_timers(data):
