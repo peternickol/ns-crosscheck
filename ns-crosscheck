@@ -41,7 +41,7 @@ import subprocess
 import sys
 
 APP_ID = 'ns-crosscheck'
-VERSION = '0.1.11'
+VERSION = '0.1.12'
 MIN_PYTHON = (3, 10)
 MAX_NAMES = 2000
 RESOLVERS = (('1.1.1.1', '1.1.1.1'), ('8.8.8.8', '8.8.8.8'), ('9.9.9.9', '9.9.9.9'))
@@ -171,6 +171,7 @@ class Config:
     strict_ttl: bool = False
     timeout: float = 3
     port: int = 53
+    listing: bool = False
 
 
 def normalize_name(name):
@@ -1216,7 +1217,12 @@ def check(config):
     new = load_side(config.new_hosts, config.new_zone, shown, 'New zone', config.axfr, config.timeout, config.port)
     if delegation is None and config.delegation:
         delegation = trace(shown, config.timeout)
-    mode = 'compare' if config.new_hosts or config.new_zone else 'consistency'
+    if config.new_hosts or config.new_zone:
+        mode = 'compare'
+    elif config.listing:
+        mode = 'list'
+    else:
+        mode = 'consistency'
     capped = fill(old + new, shown, config.names, config.types, config.timeout, config.port)
     return _assemble(config, domain, mode, old, new, delegation, capped)
 
@@ -1262,7 +1268,7 @@ def _assemble(config, domain, mode, old, new, delegation, capped):
         ok=not any(item.severity == 'flaw' for item in findings),
         old_at=old_ref.address if old_ref and old_ref.address != 'zone file' else '',
         new_at=new_ref.address if new_ref and new_ref.address != 'zone file' else '',
-        solo=mode == 'consistency' and len(usable) < 2,
+        solo=_one_side(mode) and len(usable) < 2,
     )
     return report
 
@@ -1274,8 +1280,12 @@ def _reference(servers):
     return max(usable, key=lambda server: server.serial or 0)
 
 
+def _one_side(mode):
+    return mode in ('consistency', 'list')
+
+
 def _columns(mode, old, new, old_ref, new_ref):
-    if mode == 'consistency':
+    if _one_side(mode):
         others = [server for server in old if server is not old_ref and server.status in ('answered', 'zone file')]
         return old_ref, (others[0] if others else None), False
     if old_ref is None or new_ref is None:
@@ -1552,10 +1562,11 @@ def _coverage(old, new, names, capped, mode):
     cap = ' The name list reached its limit.' if capped else ''
     old_complete = any(server.complete for server in old if server.status in ('answered', 'zone file'))
     new_complete = any(server.complete for server in new if server.status in ('answered', 'zone file'))
-    if mode == 'consistency':
+    if _one_side(mode):
+        verb = 'Listed' if mode == 'list' else 'Checked'
         if old_complete:
-            return f'Checked {count} names from a zone transfer.{cap}'
-        return f'Checked {count} names by query. A server that refuses a zone transfer can hold other records.{cap}'
+            return f'{verb} {count} names from a zone transfer.{cap}'
+        return f'{verb} {count} names by query. A server that refuses a zone transfer can hold other records.{cap}'
     if old_complete and new_complete:
         return f'Checked {count} names from zone transfers.{cap}'
     if old_complete or new_complete:
@@ -1676,6 +1687,8 @@ def counts_line(report):
 
 
 def render(report, color=False):
+    if report.mode == 'list':
+        return _render_listing(report, color)
     lines = [paint(display_name(report.domain), '1;36', color), '']
     if report.mode == 'consistency':
         lines.extend(_server_block('Current', report.old, color))
@@ -1707,6 +1720,28 @@ def render(report, color=False):
         for item in notes:
             lines.extend(_finding_lines(item, color, '33'))
     lines.extend(['', report.coverage, counts_line(report), ''])
+    return '\n'.join(lines)
+
+
+def _render_listing(report, color):
+    lines = [paint(display_name(report.domain), '1;36', color)]
+    lines.extend(_table(report, color))
+    flaws = [item for item in report.findings if item.severity == 'flaw']
+    notes = [item for item in report.findings if item.severity == 'note']
+    if flaws:
+        lines.extend(['', paint('Flaws', '1;36', color)])
+        for item in flaws:
+            lines.extend(_finding_lines(item, color))
+    if notes:
+        lines.extend(['', paint('Notes', '1;36', color)])
+        for item in notes:
+            lines.extend(_finding_lines(item, color, '33'))
+    read = [server.host for server in report.old if server.status in ('answered', 'zone file')]
+    if read:
+        lines.extend(['', f'Read from {", ".join(read)}.'])
+    if report.coverage:
+        lines.extend(['', report.coverage])
+    lines.append('')
     return '\n'.join(lines)
 
 
@@ -1773,7 +1808,7 @@ def _table(report, color):
 
 
 def _type_table(rows, report, color, apex):
-    solo = report.solo or report.mode == 'consistency'
+    solo = _single_column(report)
     shown = []
     for name, _rtype, ttl, old, new, status in rows:
         old_text = old or '(none)'
@@ -1810,8 +1845,12 @@ def _type_table(rows, report, color, apex):
     return lines
 
 
+def _single_column(report):
+    return report.solo or _one_side(report.mode)
+
+
 def _table_rows(report):
-    solo = report.solo or report.mode == 'consistency'
+    solo = _single_column(report)
     for name_row in report.names:
         items = sorted(name_row.types, key=lambda item: item.rtype)
         for item in items:
@@ -1873,7 +1912,7 @@ def _copy_block(report):
 
 
 def _copy_lines(report):
-    if report.solo or report.mode == 'consistency':
+    if _single_column(report):
         return []
     lines = []
     for name_row in report.names:
@@ -2035,62 +2074,6 @@ def _ttl(values, ttl):
     return tuple(f'{value}  TTL {ttl}' for value in values)
 
 
-def nameserver_list(domain, timeout, port):
-    shown = display_name(normalize_name(domain))
-    delegation = trace(shown, timeout)
-    if not delegation.names:
-        detail = delegation.error or 'no nameservers were returned'
-        raise Fail(f'The current nameservers could not be found. {detail}')
-    rows = []
-    for name in delegation.names:
-        key = normalize_name(name)
-        have = list(delegation.addresses.get(key, ()))
-        if not any(':' not in item for item in have):
-            have.extend(_lookup_addresses(key, 'A', timeout, port))
-        if not any(':' in item for item in have):
-            have.extend(_lookup_addresses(key, 'AAAA', timeout, port))
-        seen = []
-        for item in have:
-            if item not in seen:
-                seen.append(item)
-        v4 = [item for item in seen if ':' not in item]
-        v6 = [item for item in seen if ':' in item]
-        rows.append((display_name(name), tuple(v4 + v6)))
-    rows.sort(key=lambda row: row[0])
-    return shown, rows
-
-
-def _lookup_addresses(name, rtype, timeout, port):
-    for address, _label in RESOLVERS:
-        outcome = query(address, display_name(name), rtype, timeout, port, rd=True)
-        if isinstance(outcome[0], str):
-            continue
-        status, _flags = outcome[0]
-        answers = outcome[1]
-        if status == 'NXDOMAIN':
-            return []
-        if status != 'NOERROR':
-            continue
-        return [item[3].split()[0] for item in answers if item[2] == rtype]
-    return []
-
-
-def render_nameservers(domain, rows, color):
-    lines = [paint(domain, '1;36', color), '', paint('Nameservers', '1;36', color)]
-    for name, addresses in rows:
-        extra = f'  {"  ".join(addresses)}' if addresses else ''
-        lines.append(f'  {name}{extra}')
-    lines.append('')
-    return '\n'.join(lines)
-
-
-def nameservers_json(domain, rows):
-    return {
-        'domain': domain,
-        'nameservers': [{'name': name, 'addresses': list(addresses)} for name, addresses in rows],
-    }
-
-
 def _listing(args):
     return not any((
         args.old, args.new, args.old_zone, args.new_zone, args.names, args.types,
@@ -2136,19 +2119,6 @@ def main(argv=None):
         if not updater.is_file():
             parser.error('This copy has no installed updater. Run the installer, or update your source checkout with Git.')
         raise SystemExit(subprocess.call([sys.executable, str(updater)]))
-    if args.domain and _listing(args):
-        if args.timeout <= 0:
-            parser.error('--timeout must be greater than zero.')
-        try:
-            shown, rows = nameserver_list(args.domain, args.timeout, args.port)
-        except Fail as error:
-            print(f'ns-crosscheck: {error}', file=sys.stderr)
-            return 2
-        if args.json:
-            print(json.dumps(nameservers_json(shown, rows), indent=2))
-        else:
-            sys.stdout.write(render_nameservers(shown, rows, _color(args)))
-        return 0
     try:
         report = _report(parser, args)
     except Fail as error:
@@ -2194,7 +2164,8 @@ def _report(parser, args):
         types=types,
         axfr=not args.no_axfr,
         delegation=not args.no_delegation,
-        resolvers=not args.no_resolvers,
+        resolvers=not args.no_resolvers and not _listing(args),
+        listing=_listing(args),
         strict_ttl=args.strict_ttl,
         timeout=args.timeout,
         port=args.port,

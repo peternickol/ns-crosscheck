@@ -155,7 +155,7 @@ class ToolTest(unittest.TestCase):
         self.assertIn('\033[31m', colored.stdout)
         self.assertIn('\033[32m', colored.stdout)
         version = self.command('--version', path='/usr/bin')
-        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.11')
+        self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.12')
 
     def test_dig_transfer_reports_the_move(self):
         self.place('ns1.old.test', 'example.com', 'SOA', message(
@@ -535,46 +535,73 @@ class ToolTest(unittest.TestCase):
         self.assertIn('Every compared name matches.', review.stdout)
         self.assertNotIn('>', review.stdout)
 
-    def test_a_domain_alone_lists_every_nameserver(self):
+    def test_a_domain_alone_lists_the_records(self):
         (self.fixture / 'trace_example.com').write_text(
-            '. 100 IN NS a.root-servers.net.\n'
-            ';; Received 20 bytes from 1.1.1.1#53(1.1.1.1) in 1 ms\n'
-            'example.com. 100 IN NS ns2.old.test.\n'
             'example.com. 100 IN NS ns1.old.test.\n'
-            'ns1.old.test. 100 IN A 192.0.2.1\n'
-            'ns1.old.test. 100 IN AAAA 2001:db8::1\n'
-            'ns2.old.test. 100 IN A 192.0.2.2\n'
-            ';; Received 80 bytes from 192.5.6.30#53(a.gtld-servers.net) in 2 ms\n'
+            'example.com. 100 IN NS ns2.old.test.\n'
+            ';; Received 40 bytes from 192.5.6.30#53(a.gtld-servers.net) in 2 ms\n'
         )
+        for host, address in (('ns1.old.test', '192.0.2.1'), ('ns2.old.test', '192.0.2.2')):
+            self.place(host, 'example.com', 'SOA', message(
+                address, 'NOERROR', 'qr aa',
+                ['example.com. 3600 IN SOA ns1.old.test. host.example.com. 10 1 1 1 1'],
+            ))
+            self.place(host, 'example.com', 'AXFR', message(address, 'NOERROR', 'qr aa', OLD.splitlines()))
         result = self.command('example.com', '--plain')
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertIn('ns1.old.test  192.0.2.1  2001:db8::1', result.stdout)
-        self.assertIn('ns2.old.test  192.0.2.2', result.stdout)
-        self.assertLess(result.stdout.index('ns1.old.test'), result.stdout.index('ns2.old.test'))
-        self.assertNotIn('Checked', result.stdout)
-        self.assertNotIn('Records', result.stdout)
+        self.assertIn('\n  A\n', result.stdout)
+        self.assertIn('192.0.2.10', result.stdout)
+        self.assertIn('www.example.com', result.stdout)
+        self.assertIn('192.0.2.20', result.stdout)
+        self.assertIn('\n  NS\n', result.stdout)
+        self.assertIn('ns1.old.test.', result.stdout)
+        self.assertNotIn('Delegation', result.stdout)
+        self.assertNotIn('Resolvers', result.stdout)
+        self.assertIn('Listed 2 names from a zone transfer.', result.stdout)
+        self.assertIn('Read from ns1.old.test, ns2.old.test.', result.stdout)
         calls = (self.fixture / 'calls').read_text()
         self.assertIn('+trace', calls)
-        self.assertNotIn('AXFR', calls)
+        self.assertIn('AXFR', calls)
         listed = self.command('example.com', '--json')
         self.assertEqual(listed.returncode, 0, listed.stderr)
         payload = json.loads(listed.stdout)
-        self.assertEqual(payload['nameservers'][0]['name'], 'ns1.old.test')
-        self.assertEqual(payload['nameservers'][0]['addresses'], ['192.0.2.1', '2001:db8::1'])
-        self.assertEqual([item['name'] for item in payload['nameservers']], ['ns1.old.test', 'ns2.old.test'])
+        www = next(row for row in payload['names'] if row['name'] == 'www.example.com')
+        self.assertEqual(www['types'][0]['old'], ['192.0.2.20'])
 
-    def test_a_nameserver_address_is_looked_up_when_the_parent_has_no_glue(self):
+    def test_a_domain_alone_lists_queried_records_when_transfer_is_refused(self):
         (self.fixture / 'trace_example.com').write_text(
             'example.com. 100 IN NS ns1.old.test.\n'
             ';; Received 40 bytes from 192.5.6.30#53(a.gtld-servers.net) in 2 ms\n'
         )
-        self.place('1.1.1.1', 'ns1.old.test', 'A', message(
-            '1.1.1.1', 'NOERROR', 'qr rd ra', ['ns1.old.test. 300 IN A 192.0.2.9'],
+        self.place('ns1.old.test', 'example.com', 'SOA', message(
+            '192.0.2.1', 'NOERROR', 'qr aa',
+            ['example.com. 3600 IN SOA ns1.old.test. host.example.com. 10 1 1 1 1'],
+        ))
+        self.place('ns1.old.test', 'example.com', 'AXFR', message('192.0.2.1', 'REFUSED', 'qr', []))
+        self.place('ns1.old.test', 'example.com', 'A', message(
+            '192.0.2.1', 'NOERROR', 'qr aa', ['example.com. 3600 IN A 192.0.2.10'],
+        ))
+        self.place('ns1.old.test', 'example.com', 'MX', message(
+            '192.0.2.1', 'NOERROR', 'qr aa', ['example.com. 3600 IN MX 10 mail.example.com.'],
+        ))
+        self.place('ns1.old.test', 'example.com', 'TXT', message(
+            '192.0.2.1', 'NOERROR', 'qr aa', ['example.com. 3600 IN TXT "v=spf1 -all"'],
+        ))
+        self.place('ns1.old.test', 'example.com', 'NS', message(
+            '192.0.2.1', 'NOERROR', 'qr aa', ['example.com. 3600 IN NS ns1.old.test.'],
         ))
         result = self.command('example.com', '--plain')
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertIn('ns1.old.test  192.0.2.9', result.stdout)
-        self.assertNotIn('AXFR', (self.fixture / 'calls').read_text())
+        self.assertIn('192.0.2.10', result.stdout)
+        self.assertIn('10 mail.example.com.', result.stdout)
+        self.assertIn('"v=spf1 -all"', result.stdout)
+        self.assertIn('ns1.old.test.', result.stdout)
+        self.assertLess(result.stdout.index('\n  A\n'), result.stdout.index('\n  TXT\n'))
+        self.assertLess(result.stdout.index('\n  TXT\n'), result.stdout.index('\n  MX\n'))
+        self.assertLess(result.stdout.index('\n  MX\n'), result.stdout.index('\n  NS\n'))
+        self.assertIn('Listed', result.stdout)
+        self.assertIn('by query', result.stdout)
+        self.assertNotIn('Delegation', result.stdout)
 
     def test_missing_dig_is_an_error_and_the_demo_is_not(self):
         empty = self.root / 'empty'
@@ -597,7 +624,7 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Installed NS Cross-check', result.stdout)
             version = subprocess.run([str(bindir / 'ns-crosscheck'), '--version'], check=False, capture_output=True, text=True)
-            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.11')
+            self.assertEqual(version.stdout.strip(), 'ns-crosscheck 0.1.12')
             again = subprocess.run(
                 [sys.executable, str(ROOT / 'install.py'), '--from-dir', str(ROOT), '--bin-dir', str(bindir)],
                 check=False, capture_output=True, text=True,

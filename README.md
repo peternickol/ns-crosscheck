@@ -102,8 +102,8 @@ Each side is a list of hosts or one zone file. A host is passed to `dig` as
 holds. The report shows the address `dig` reached and how long the SOA query
 took.
 
-A domain by itself prints the nameservers the registry delegates to, with
-the address of each one. Pass `--old` or `--new` to compare records. Leave
+A domain by itself lists the records on the nameservers the registry
+delegates to. Pass `--old` or `--new` to compare two sets of records. Leave
 `--old` out of a comparison and `dig +trace` supplies the current nameservers.
 
 ```bash
