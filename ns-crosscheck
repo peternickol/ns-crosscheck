@@ -35,7 +35,7 @@ import subprocess
 import sys
 
 APP_ID = 'ns-crosscheck'
-VERSION = '0.1.0'
+VERSION = '0.1.1'
 MIN_PYTHON = (3, 10)
 MAX_NAMES = 2000
 RESOLVERS = (('1.1.1.1', '1.1.1.1'), ('8.8.8.8', '8.8.8.8'), ('9.9.9.9', '9.9.9.9'))
@@ -81,6 +81,7 @@ class Server:
     complete: bool = False
     aa: bool = False
     elapsed_ms: int | None = None
+    tcp: bool = False
     records: dict = field(default_factory=dict)
 
 
@@ -201,6 +202,18 @@ def dig_timeout(timeout):
     return max(1, int(timeout))
 
 
+# -r ignores ~/.digrc. Cookies and DNSSEC are left off so an authoritative
+# server sees an ordinary query. +yaml stays last among the stable options.
+_DIG_OPTS = ('+noidnin', '+noidnout', '+nocookie', '+nodnssec', '-r')
+_RETRY = {'timeout', 'error', 'unreachable', 'REFUSED', 'FORMERR', 'SERVFAIL'}
+
+
+def _status_of(outcome):
+    if isinstance(outcome[0], str):
+        return outcome[0]
+    return outcome[0][0]
+
+
 def run_dig(args, timeout, limit):
     if shutil.which('dig') is None:
         raise Fail('dig is not installed. Install bind9-dnsutils.')
@@ -223,9 +236,11 @@ def run_dig(args, timeout, limit):
     return text, None, result.returncode
 
 
-def query(host, name, rtype, timeout, port, rd):
+def query(host, name, rtype, timeout, port, rd, tcp=False):
     seconds = dig_timeout(timeout)
-    args = [f'@{host}', '-p', str(port), name, rtype, f'+timeout={seconds}', '+tries=1', '+noidnin', '+noidnout', '+yaml']
+    args = [f'@{host}', '-p', str(port), name, rtype, f'+timeout={seconds}', '+tries=1', *_DIG_OPTS, '+yaml']
+    if tcp:
+        args.append('+tcp')
     if not rd:
         args.append('+norecurse')
     text, failure, _code = run_dig(args, timeout, seconds + 15)
@@ -234,9 +249,11 @@ def query(host, name, rtype, timeout, port, rd):
     return parse_message(text)
 
 
-def transfer(host, name, timeout, port):
+def transfer(host, name, timeout, port, tcp=False):
     seconds = dig_timeout(timeout)
-    args = [f'@{host}', '-p', str(port), name, 'AXFR', f'+timeout={seconds}', '+tries=1', '+noidnin', '+noidnout', '+yaml']
+    args = [f'@{host}', '-p', str(port), name, 'AXFR', f'+timeout={seconds}', '+tries=1', *_DIG_OPTS, '+yaml']
+    if tcp:
+        args.append('+tcp')
     text, failure, _code = run_dig(args, timeout, seconds + 60)
     if failure:
         return failure, [], [], '', None
@@ -244,8 +261,19 @@ def transfer(host, name, timeout, port):
 
 
 def trace(name, timeout):
+    parsed = _trace(name, timeout, tcp=False)
+    if parsed.error:
+        alt = _trace(name, timeout, tcp=True)
+        if not alt.error:
+            return alt
+    return parsed
+
+
+def _trace(name, timeout, tcp):
     seconds = dig_timeout(timeout)
-    args = [name, 'NS', '+trace', '+nodnssec', f'+timeout={seconds}', '+tries=1', '+noidnin', '+noidnout']
+    args = [name, 'NS', '+trace', '+nodnssec', f'+timeout={seconds}', '+tries=1', *_DIG_OPTS]
+    if tcp:
+        args.append('+tcp')
     text, failure, _code = run_dig(args, timeout, seconds + 60)
     if failure:
         return Delegation(error='The parent servers did not answer.')
@@ -416,6 +444,13 @@ def load_side(hosts, zone, domain, label, axfr, timeout, port):
 
 def probe(host, domain, axfr, timeout, port):
     outcome = query(host, domain, 'SOA', timeout, port, rd=False)
+    tcp = False
+    # A firewall or an anycast node can refuse UDP and still answer TCP.
+    if _status_of(outcome) in _RETRY:
+        alt = query(host, domain, 'SOA', timeout, port, rd=False, tcp=True)
+        if _status_of(alt) not in _RETRY:
+            outcome = alt
+            tcp = True
     if isinstance(outcome[0], str):
         failure, _answers, _authority, address, elapsed = outcome
         return Server(host, address, failure, _failure_detail(failure), elapsed_ms=elapsed)
@@ -424,10 +459,10 @@ def probe(host, domain, axfr, timeout, port):
         code = 'nodata' if status == 'NOERROR' else _status_code(status)
         return Server(host, address, code, _failure_detail(code), elapsed_ms=elapsed)
     server = Server(
-        host, address, 'answered', '', aa='aa' in flags.split(), elapsed_ms=elapsed,
+        host, address, 'answered', '', aa='aa' in flags.split(), elapsed_ms=elapsed, tcp=tcp,
     )
     if axfr:
-        moved = transfer(host, domain, timeout, port)
+        moved = transfer(host, domain, timeout, port, tcp=tcp)
         if not isinstance(moved[0], str):
             (zone_status, zone_flags), zone_answers, _authority, _address, _elapsed = moved
             kept, closed = _cut_axfr(zone_answers, domain)
@@ -520,7 +555,7 @@ def fill(servers, domain, extra, configured, timeout, port):
                 for rtype in _types_for(name, origin, configured, servers):
                     if (name, rtype) in server.records:
                         continue
-                    outcome = query(server.host, display_name(name), rtype, timeout, port, rd=False)
+                    outcome = query(server.host, display_name(name), rtype, timeout, port, rd=False, tcp=server.tcp)
                     _store(server, name, rtype, outcome)
                     rr = server.records.get((name, rtype))
                     if rr and rr.data:
